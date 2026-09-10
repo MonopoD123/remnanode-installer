@@ -8,7 +8,7 @@
 set -o pipefail
 
 # ================== НАСТРОЙКИ РЕПОЗИТОРИЯ (ЗАМЕНИТЕ) ==================
-GITHUB_USER="YOUR_GITHUB_USERNAME"      # ваш логин на GitHub
+GITHUB_USER="MonopoD123"      # ваш логин на GitHub
 GITHUB_REPO="remnanode-installer"       # имя репозитория
 GITHUB_BRANCH="main"                    # ветка
 SITE_ZIP_NAME="radio.zip"               # архив с сайтом в корне репозитория
