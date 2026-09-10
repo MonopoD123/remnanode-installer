@@ -21,94 +21,13 @@
 Требования: Ubuntu 22.04+/Debian 11+, root, A‑запись домена указывает на IP сервера (для пункта 2/3).
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ВАШ_ЛОГИН/remnanode-installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/MonopoD123/remnanode-installer/main/install.sh)
 ```
 
 > Используйте именно `bash <(curl ...)`, а не `curl ... | bash`.
 
 ---
 
-# Как залить на GitHub
-
-## Шаг 0. Подготовьте файлы
-
-В папке проекта должно быть:
-
-```
-remnanode-installer/
-├── install.sh        ← скрипт
-├── radio.zip         ← ваш архив с сайтом (в корне!)
-├── README.md
-└── .gitattributes
-```
-
-Откройте `install.sh` и в самом начале замените:
-
-```bash
-GITHUB_USER="YOUR_GITHUB_USERNAME"   # ← ваш логин GitHub
-GITHUB_REPO="remnanode-installer"    # ← имя репозитория, если назовёте иначе
-```
-
-Также замените `ВАШ_ЛОГИН` в команде запуска выше в этом README.
-
-⚠️ Если редактируете на Windows — сохраняйте с окончаниями строк **LF** (в VS Code / Notepad++ справа внизу `CRLF → LF`), иначе bash выдаст ошибки `$'\r': command not found`. Файл `.gitattributes` защищает от этого при заливке через git.
-
-## Шаг 1. Создайте репозиторий
-
-1. Зарегистрируйтесь/войдите на https://github.com
-2. Справа вверху **«+» → New repository**
-3. Repository name: `remnanode-installer`
-4. Выберите **Public** (обязательно — иначе сервер не сможет скачать скрипт и сайт без токена)
-5. Галочки README/.gitignore **не ставьте** → **Create repository**
-
-## Шаг 2 (вариант А). Через браузер — самый простой
-
-1. На странице пустого репозитория нажмите ссылку **«uploading an existing file»**
-2. Перетащите в окно `install.sh`, `radio.zip`, `README.md`, `.gitattributes`
-   (файл `.gitattributes` скрытый — на macOS покажите скрытые файлы `Cmd+Shift+.`)
-3. Внизу **Commit changes**
-
-## Шаг 2 (вариант Б). Через git в терминале
-
-```bash
-cd remnanode-installer
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/ВАШ_ЛОГИН/remnanode-installer.git
-git push -u origin main
-```
-
-При `git push` GitHub спросит логин и пароль. **Пароль от аккаунта не подойдёт** — нужен токен:
-GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → Generate new token → отметьте `repo` → скопируйте токен и вставьте его вместо пароля.
-
-## Шаг 3. Проверьте
-
-Откройте в браузере (должен показаться текст скрипта):
-
-```
-https://raw.githubusercontent.com/ВАШ_ЛОГИН/remnanode-installer/main/install.sh
-```
-
-И архив сайта должен скачиваться по:
-
-```
-https://raw.githubusercontent.com/ВАШ_ЛОГИН/remnanode-installer/main/radio.zip
-```
-
-## Как обновить сайт или скрипт
-
-- **Браузер:** откройте файл в репозитории → для `radio.zip` загрузите новый через **Add file → Upload files** (с тем же именем, он заменится); для `install.sh` — значок карандаша → правка → **Commit changes**.
-- **git:** замените файлы локально, затем
-  ```bash
-  git add . && git commit -m "update" && git push
-  ```
-- На сервере выберите пункт **4) Обновить файлы сайта из GitHub**.
-
-> raw.githubusercontent.com кэширует файлы до ~5 минут — если сразу после заливки скачалась старая версия, подождите немного.
-
----
 
 ## Где что лежит на сервере
 
