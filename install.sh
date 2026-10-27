@@ -3,6 +3,7 @@
 #  Remnawave Node Installer
 #  1) Установка ноды Remnawave (по https://docs.rw/install/remnawave-node)
 #  2) Установка ноды + сайт-заглушка на nginx с SSL (Let's Encrypt)
+#  3) Установка / обновление ядра Xray-core на ноде
 # =====================================================================
 
 set -o pipefail
@@ -24,11 +25,20 @@ ACME_ROOT="/var/www/letsencrypt"
 STATE_FILE="/etc/remnanode-installer.conf"
 DEFAULT_SELFSTEAL_PORT="9443"
 
+# Своё ядро Xray: бинарник на хосте + docker-compose.override.yml,
+# который монтирует его в контейнер поверх встроенного в образ.
+XRAY_DIR="/var/lib/remnanode"
+XRAY_BIN="${XRAY_DIR}/xray"
+OVERRIDE_FILE="${NODE_DIR}/docker-compose.override.yml"
+OVERRIDE_MARK="remnanode-installer: custom xray-core"
+XRAY_RELEASES_API="https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100"
+
 NODE_PORT=""
 DOMAIN=""
 EMAIL=""
 SITE_MODE=""          # selfsteal | public
 SELFSTEAL_PORT=""
+XRAY_VERSION=""
 
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
@@ -290,6 +300,11 @@ update_node() {
     docker compose pull && docker compose up -d && docker image prune -f >/dev/null
     ok "Нода обновлена"
     docker compose ps
+    if custom_core_active; then
+        echo
+        warn "Используется своё ядро Xray $(host_xray_version) — встроенное в новый образ не применяется."
+        warn "Вернуть встроенное ядро: пункт «Ядро Xray» → «Вернуть встроенное»."
+    fi
 }
 
 show_logs() {
@@ -299,6 +314,288 @@ show_logs() {
     trap ':' INT
     docker compose logs -f -t --tail 100
     trap - INT
+}
+
+# ============================ ЯДРО XRAY ===============================
+# Схема как в remnanode-xray-update.sh (DigneZzZ/remnawave-scripts):
+# бинарник лежит в /var/lib/remnanode/xray и монтируется в контейнер
+# поверх /usr/local/bin/xray. Монтирование задаётся в отдельном
+# docker-compose.override.yml — основной docker-compose.yml не трогаем,
+# а откат на встроенное ядро — это просто удаление override-файла.
+
+xray_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)   echo "64" ;;
+        aarch64|armv8*) echo "arm64-v8a" ;;
+        armv7*)         grep -qw vfp /proc/cpuinfo && echo "arm32-v7a" || echo "arm32-v5" ;;
+        armv6*)         grep -qw vfp /proc/cpuinfo && echo "arm32-v6" || echo "arm32-v5" ;;
+        i386|i686)      echo "32" ;;
+        riscv64)        echo "riscv64" ;;
+        s390x)          echo "s390x" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Имя сервиса ноды из основного docker-compose.yml (обычно remnanode)
+node_service() {
+    (cd "$NODE_DIR" && docker compose -f "$COMPOSE_FILE" config --services 2>/dev/null | head -1)
+}
+
+custom_core_active() {
+    [[ -f "$OVERRIDE_FILE" ]] && grep -q '/usr/local/bin/xray' "$OVERRIDE_FILE"
+}
+
+host_xray_version() {
+    [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}'
+}
+
+container_xray_version() {
+    local svc; svc="$(node_service)"
+    [[ -z "$svc" ]] && return 1
+    (cd "$NODE_DIR" && docker compose exec -T "$svc" xray version 2>/dev/null) | awk 'NR==1{print $2}'
+}
+
+# Список релизов: "тег<TAB>prerelease<TAB>дата". $1 = 1 — включая pre-release.
+# XTLS помечает pre-release большинство релизов, поэтому берём 100 записей.
+fetch_xray_releases() {
+    local json
+    json="$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' "$XRAY_RELEASES_API")" || return 1
+    jq -r --argjson pre "${1:-0}" '
+        [ .[] | select(.draft | not) | select($pre == 1 or (.prerelease | not)) ][:8][]
+        | "\(.tag_name)\t\(.prerelease)\t\(.published_at[:10])"' <<<"$json"
+}
+
+# Интерактивный выбор версии, результат — в XRAY_VERSION
+choose_xray_version() {
+    local pre=0 list choice i t p d mark
+    local -a tags flags dates
+    XRAY_VERSION=""
+    while true; do
+        info "Получаю список релизов Xray-core..."
+        if ! list="$(fetch_xray_releases "$pre")" || [[ -z "$list" ]]; then
+            if (( pre == 0 )); then
+                warn "Стабильных релизов не нашлось — показываю все, включая pre-release"
+                pre=1
+                continue
+            fi
+            err "Не удалось получить список релизов (нет доступа к api.github.com или исчерпан лимит запросов)"
+            ask XRAY_VERSION "Введите версию вручную, например v26.7.28 (Enter — отмена)" ""
+            [[ -z "$XRAY_VERSION" ]] && return 1
+            [[ "$XRAY_VERSION" == v* ]] || XRAY_VERSION="v${XRAY_VERSION}"
+            return 0
+        fi
+
+        tags=(); flags=(); dates=()
+        while IFS=$'\t' read -r t p d; do
+            tags+=("$t"); flags+=("$p"); dates+=("$d")
+        done <<<"$list"
+
+        echo
+        echo -e "${BOLD}Доступные версии Xray-core:${NC}"
+        for i in "${!tags[@]}"; do
+            mark=""
+            if [[ "${flags[$i]}" == "true" ]]; then
+                mark=" ${YELLOW}(pre-release)${NC}"
+            elif (( i == 0 )); then
+                mark=" ${GREEN}(последняя стабильная)${NC}"
+            fi
+            echo -e "  $((i + 1))) ${tags[$i]}  ${DIM}${dates[$i]}${NC}${mark}"
+        done
+        echo "  m) Ввести версию вручную"
+        if (( pre )); then echo "  s) Показать только стабильные"; else echo "  a) Показать и pre-release"; fi
+        echo "  0) Отмена"
+        ask choice "Выбор" "1"
+
+        case "${choice,,}" in
+            0) return 1 ;;
+            a) pre=1 ;;
+            s) pre=0 ;;
+            m)
+                ask XRAY_VERSION "Версия (например v26.7.28)"
+                [[ -z "$XRAY_VERSION" ]] && continue
+                [[ "$XRAY_VERSION" == v* ]] || XRAY_VERSION="v${XRAY_VERSION}"
+                return 0
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#tags[@]} )); then
+                    XRAY_VERSION="${tags[$((choice - 1))]}"
+                    if [[ "${flags[$((choice - 1))]}" == "true" ]]; then
+                        warn "${XRAY_VERSION} — pre-release, в нём могут быть ошибки."
+                        confirm "Ставить на эту ноду?" n || continue
+                    fi
+                    return 0
+                fi
+                warn "Нет такого пункта"
+                ;;
+        esac
+    done
+}
+
+# Скачивание, проверка SHA-256 и установка бинарника в $XRAY_BIN
+download_xray() {
+    local ver="$1" arch zip url tmp expected sum got f
+    arch="$(xray_arch)" || { err "Архитектура $(uname -m) не поддерживается"; return 1; }
+    zip="Xray-linux-${arch}.zip"
+    url="https://github.com/XTLS/Xray-core/releases/download/${ver}/${zip}"
+    tmp="$(mktemp -d)"
+
+    info "Скачиваю Xray-core ${ver} (${arch})..."
+    if ! curl -fL --retry 3 --connect-timeout 10 --progress-bar -o "$tmp/$zip" "$url"; then
+        err "Не удалось скачать $url"
+        err "Проверьте, что версия ${ver} существует и для неё есть сборка ${arch}."
+        rm -rf "$tmp"; return 1
+    fi
+
+    if curl -fsSL --retry 3 --connect-timeout 10 -o "$tmp/$zip.dgst" "$url.dgst"; then
+        expected="$(awk -F '= ' '/256=/ {print $2; exit}' "$tmp/$zip.dgst")"
+        sum="$(sha256sum "$tmp/$zip" | awk '{print $1}')"
+        if [[ -z "$expected" ]]; then
+            warn "В файле .dgst нет SHA-256 — пропускаю проверку"
+        elif [[ "$sum" != "$expected" ]]; then
+            err "Контрольная сумма не совпадает — архив повреждён"
+            rm -rf "$tmp"; return 1
+        else
+            ok "Контрольная сумма SHA-256 совпадает"
+        fi
+    else
+        warn "Файл контрольной суммы не найден — пропускаю проверку"
+    fi
+
+    if ! unzip -q -o "$tmp/$zip" -d "$tmp/x" || [[ ! -f "$tmp/x/xray" ]]; then
+        err "В архиве нет бинарника xray"
+        rm -rf "$tmp"; return 1
+    fi
+    chmod +x "$tmp/x/xray"
+    got="$("$tmp/x/xray" version 2>/dev/null | awk 'NR==1{print $2}')"
+    if [[ -z "$got" ]]; then
+        err "Скачанный бинарник не запускается на этом сервере"
+        rm -rf "$tmp"; return 1
+    fi
+
+    mkdir -p "$XRAY_DIR"
+    [[ -f "$XRAY_BIN" ]] && cp -a "$XRAY_BIN" "${XRAY_BIN}.prev"
+    install -m 755 "$tmp/x/xray" "${XRAY_BIN}.new" && mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
+    for f in geoip.dat geosite.dat; do
+        [[ -f "$tmp/x/$f" ]] && install -m 644 "$tmp/x/$f" "${XRAY_DIR}/$f"
+    done
+    rm -rf "$tmp"
+    ok "Xray-core ${got} сохранён в ${XRAY_BIN}"
+}
+
+# $1 = 1 — монтировать и geoip.dat / geosite.dat из релиза Xray
+write_core_override() {
+    local svc; svc="$(node_service)"
+    if [[ -z "$svc" ]]; then
+        err "Не удалось определить сервис в $COMPOSE_FILE"
+        return 1
+    fi
+    [[ -f "$OVERRIDE_FILE" ]] && cp "$OVERRIDE_FILE" "${OVERRIDE_FILE}.bak.$(date +%s)"
+    {
+        echo "# ${OVERRIDE_MARK}"
+        echo "# Удалите этот файл и пересоздайте контейнер, чтобы вернуть встроенное ядро."
+        echo "services:"
+        echo "  ${svc}:"
+        echo "    volumes:"
+        echo "      - ${XRAY_BIN}:/usr/local/bin/xray:ro"
+        if [[ "${1:-0}" == "1" ]]; then
+            echo "      - ${XRAY_DIR}/geoip.dat:/usr/local/share/xray/geoip.dat:ro"
+            echo "      - ${XRAY_DIR}/geosite.dat:/usr/local/share/xray/geosite.dat:ro"
+        fi
+    } >"$OVERRIDE_FILE"
+
+    if ! (cd "$NODE_DIR" && docker compose config -q); then
+        err "Итоговая конфигурация docker compose невалидна — удаляю override"
+        rm -f "$OVERRIDE_FILE"
+        return 1
+    fi
+}
+
+# Пересоздать контейнер (bind-mount файла подхватывается только так)
+recreate_node() {
+    local svc; svc="$(node_service)"
+    (cd "$NODE_DIR" && docker compose up -d --force-recreate) || return 1
+    sleep 5
+    (cd "$NODE_DIR" && docker compose ps --status running --services) | grep -qx "$svc"
+}
+
+update_core() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    if ! command -v jq >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+        info "Ставлю jq и unzip..."
+        apt-get update -qq >/dev/null
+        apt_install curl unzip jq || { err "Не удалось установить jq/unzip"; return 1; }
+    fi
+
+    local now src="встроенное в образ"
+    custom_core_active && src="своё, ${XRAY_BIN}"
+    now="$(container_xray_version)"
+    info "Сейчас в ноде: Xray ${now:-неизвестно} (${src})"
+
+    if [[ -f "$OVERRIDE_FILE" ]] && ! grep -q "$OVERRIDE_MARK" "$OVERRIDE_FILE"; then
+        warn "Найден ваш собственный $OVERRIDE_FILE — он будет перезаписан (с бэкапом)."
+        confirm "Продолжить?" n || return 0
+    fi
+
+    choose_xray_version || { info "Отменено"; return 0; }
+    download_xray "$XRAY_VERSION" || return 1
+
+    local geo=0
+    echo
+    info "В образе ноды уже есть geoip.dat / geosite.dat. Обычно их трогать не нужно."
+    confirm "Заменить их файлами из релиза Xray ${XRAY_VERSION}?" n && geo=1
+    write_core_override "$geo" || return 1
+
+    info "Пересоздаю контейнер ноды..."
+    if ! recreate_node; then
+        err "Нода не поднялась с новым ядром — возвращаю встроенное"
+        rm -f "$OVERRIDE_FILE"
+        recreate_node && warn "Нода запущена со встроенным ядром"
+        (cd "$NODE_DIR" && docker compose logs --tail 30 -t)
+        return 1
+    fi
+
+    now="$(container_xray_version)"
+    line
+    ok "Нода работает, ядро в контейнере: Xray ${now:-?}"
+    [[ -n "$now" && "v${now#v}" != "v${XRAY_VERSION#v}" ]] && \
+        warn "Версия в контейнере отличается от выбранной ${XRAY_VERSION} — проверьте логи."
+    echo "  Бинарник:  ${XRAY_BIN}"
+    echo "  Override:  ${OVERRIDE_FILE}"
+    echo -e "  ${DIM}Проверьте в панели, что нода online и Xray запущен.${NC}"
+    echo -e "  ${DIM}Если нода не принимает конфиг — верните встроенное ядро (пункт 2 этого меню).${NC}"
+    line
+}
+
+restore_bundled_core() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    if ! custom_core_active; then
+        info "Уже используется ядро, встроенное в образ ноды"
+        return 0
+    fi
+    confirm "Вернуть ядро, встроенное в образ ноды?" y || return 0
+    cp "$OVERRIDE_FILE" "${OVERRIDE_FILE}.bak.$(date +%s)"
+    rm -f "$OVERRIDE_FILE"
+    info "Пересоздаю контейнер ноды..."
+    if recreate_node; then
+        ok "Нода работает со встроенным ядром: Xray $(container_xray_version)"
+    else
+        err "Контейнер не запустился. Последние логи:"
+        (cd "$NODE_DIR" && docker compose logs --tail 30 -t)
+        return 1
+    fi
+}
+
+core_menu() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    echo
+    echo "  1) Установить / обновить ядро Xray (выбор версии)"
+    echo "  2) Вернуть встроенное в образ ядро"
+    echo "  0) Назад"
+    local c; ask c "Выбор" "1"
+    case "$c" in
+        1) update_core ;;
+        2) restore_bundled_core ;;
+    esac
 }
 
 # ============================ ФАЕРВОЛ =================================
@@ -645,6 +942,10 @@ uninstall_menu() {
             confirm "Точно удалить ноду (контейнер и ${NODE_DIR})?" n || return 0
             if [[ -f "$COMPOSE_FILE" ]]; then (cd "$NODE_DIR" && docker compose down); fi
             rm -rf "$NODE_DIR"
+            if [[ -f "$XRAY_BIN" ]] && confirm "Удалить также своё ядро Xray (${XRAY_DIR})?" y; then
+                rm -f "$XRAY_BIN" "${XRAY_BIN}.prev" "${XRAY_DIR}/geoip.dat" "${XRAY_DIR}/geosite.dat"
+                rmdir "$XRAY_DIR" 2>/dev/null
+            fi
             ok "Нода удалена"
             ;;
         2)
@@ -666,7 +967,7 @@ uninstall_menu() {
 
 # ============================ МЕНЮ ====================================
 status_line() {
-    local node_st site_st
+    local node_st site_st core_st
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
         node_st="${GREEN}работает${NC}"
     elif [[ -f "$COMPOSE_FILE" ]]; then
@@ -677,6 +978,14 @@ status_line() {
     load_state
     if [[ -n "$DOMAIN" ]]; then site_st="${GREEN}${DOMAIN}${NC} (${SITE_MODE})"; else site_st="${DIM}нет${NC}"; fi
     echo -e "  Нода: ${node_st}    Сайт: ${site_st}"
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        if custom_core_active; then
+            core_st="${GREEN}$(host_xray_version)${NC} (своё)"
+        else
+            core_st="${DIM}встроенное в образ${NC}"
+        fi
+        echo -e "  Ядро Xray: ${core_st}"
+    fi
 }
 
 show_menu() {
@@ -695,7 +1004,8 @@ show_menu() {
     echo "  4) Обновить файлы сайта из GitHub"
     echo "  5) Логи ноды"
     echo "  6) Обновить ноду"
-    echo "  7) Удаление"
+    echo "  7) Ядро Xray (обновить / вернуть встроенное)"
+    echo "  8) Удаление"
     echo "  0) Выход"
     line
 }
@@ -713,7 +1023,8 @@ main() {
             4) update_site_files;  pause ;;
             5) show_logs;          pause ;;
             6) update_node;        pause ;;
-            7) uninstall_menu;     pause ;;
+            7) core_menu;          pause ;;
+            8) uninstall_menu;     pause ;;
             0) echo "Пока!"; exit 0 ;;
             *) warn "Нет такого пункта"; sleep 1 ;;
         esac
