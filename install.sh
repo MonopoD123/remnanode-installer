@@ -3,6 +3,7 @@
 #  Remnawave Node Installer
 #  1) Установка ноды Remnawave (по https://docs.rw/install/remnawave-node)
 #  2) Установка ноды + сайт-заглушка на nginx с SSL (Let's Encrypt)
+#     (на выбор: «Радио», игра «Курятник» или свой zip)
 #  3) Установка / обновление ядра Xray-core на ноде
 #  4) Проброс сертификатов Let's Encrypt в ноду для gRPC/TLS inbound'ов
 #  5) Запуск установщика rkn-guard (Flecksis/rkn-guard)
@@ -14,11 +15,17 @@ set -o pipefail
 GITHUB_USER="MonopoD123"      # ваш логин на GitHub
 GITHUB_REPO="remnanode-installer"       # имя репозитория
 GITHUB_BRANCH="main"                    # ветка
-SITE_ZIP_NAME="radio.zip"               # архив с сайтом в корне репозитория
+# Архивы сайтов-заглушек в корне репозитория
+SITE_TEMPLATES=("radio.zip" "eggs.zip")
+SITE_TEMPLATE_TITLES=("Радио" "Игра «Курятник» (лови яйца, LCD-стиль)")
 # ======================================================================
 
+REPO_RAW="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
 # Можно переопределить при запуске: SITE_ZIP_URL=https://... bash install.sh
-SITE_ZIP_URL="${SITE_ZIP_URL:-https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${SITE_ZIP_NAME}}"
+# (тогда выбор шаблона не спрашивается)
+SITE_ZIP_URL_ENV="${SITE_ZIP_URL:-}"
+SITE_ZIP_URL=""
+SITE_ZIP_NAME=""
 
 NODE_DIR="/opt/remnanode"
 COMPOSE_FILE="${NODE_DIR}/docker-compose.yml"
@@ -51,6 +58,7 @@ EMAIL=""
 SITE_MODE=""          # selfsteal | public
 SELFSTEAL_PORT=""
 GRPC_DOMAIN=""        # домен, сертификат которого используется в ноде
+SITE_SOURCE=""        # radio.zip | eggs.zip | URL своего архива
 XRAY_VERSION=""
 
 # ------------------------------ Оформление ----------------------------
@@ -171,6 +179,7 @@ DOMAIN="${DOMAIN}"
 SITE_MODE="${SITE_MODE}"
 SELFSTEAL_PORT="${SELFSTEAL_PORT}"
 GRPC_DOMAIN="${GRPC_DOMAIN}"
+SITE_SOURCE="${SITE_SOURCE}"
 EOF
 }
 
@@ -886,6 +895,8 @@ ask_site_params() {
     fi
     ask EMAIL "Email для Let's Encrypt (Enter — без email)" ""
 
+    choose_site_template || return 1
+
     echo
     echo "Режим работы сайта:"
     echo "  1) Selfsteal для Reality — nginx слушает только 127.0.0.1, порт 443 занимает Xray"
@@ -904,6 +915,54 @@ ask_site_params() {
         2) SITE_MODE="public"; SELFSTEAL_PORT="" ;;
         *) err "Неверный выбор"; return 1 ;;
     esac
+}
+
+# URL архива для текущего SITE_SOURCE
+resolve_site_url() {
+    if [[ -n "$SITE_ZIP_URL_ENV" ]]; then
+        SITE_ZIP_URL="$SITE_ZIP_URL_ENV"; SITE_ZIP_NAME="${SITE_ZIP_URL##*/}"
+    elif [[ "$SITE_SOURCE" == http://* || "$SITE_SOURCE" == https://* ]]; then
+        SITE_ZIP_URL="$SITE_SOURCE"; SITE_ZIP_NAME="${SITE_SOURCE##*/}"
+    else
+        SITE_ZIP_NAME="${SITE_SOURCE:-${SITE_TEMPLATES[0]}}"
+        SITE_ZIP_URL="${REPO_RAW}/${SITE_ZIP_NAME}"
+    fi
+}
+
+choose_site_template() {
+    if [[ -n "$SITE_ZIP_URL_ENV" ]]; then
+        info "Сайт берётся из SITE_ZIP_URL: $SITE_ZIP_URL_ENV"
+        SITE_SOURCE="$SITE_ZIP_URL_ENV"
+        resolve_site_url
+        return 0
+    fi
+    local i c def=1 url
+    for i in "${!SITE_TEMPLATES[@]}"; do
+        [[ "${SITE_TEMPLATES[$i]}" == "$SITE_SOURCE" ]] && def=$((i + 1))
+    done
+    echo
+    echo "Какой сайт-заглушку поставить?"
+    for i in "${!SITE_TEMPLATES[@]}"; do
+        echo -e "  $((i + 1))) ${SITE_TEMPLATE_TITLES[$i]}  ${DIM}(${SITE_TEMPLATES[$i]})${NC}"
+    done
+    echo "  u) Свой zip-архив по ссылке"
+    ask c "Выбор" "$def"
+    case "${c,,}" in
+        u)
+            ask url "Прямая ссылка на .zip (https://...)"
+            if [[ ! "$url" =~ ^https?:// ]]; then err "Нужна ссылка вида https://..."; return 1; fi
+            SITE_SOURCE="$url"
+            ;;
+        *)
+            if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SITE_TEMPLATES[@]} )); then
+                SITE_SOURCE="${SITE_TEMPLATES[$((c - 1))]}"
+            else
+                err "Нет такого пункта"; return 1
+            fi
+            ;;
+    esac
+    resolve_site_url
+    ok "Сайт: ${SITE_ZIP_NAME}"
 }
 
 # check_dns [домен]  (по умолчанию — $DOMAIN)
@@ -956,6 +1015,7 @@ install_nginx_certbot() {
 }
 
 deploy_site_files() {
+    [[ -z "$SITE_ZIP_URL" ]] && resolve_site_url
     if [[ "$SITE_ZIP_URL" == *"YOUR_GITHUB_USERNAME"* ]]; then
         err "В скрипте не указан GITHUB_USER — отредактируйте переменные в начале install.sh"
         return 1
@@ -964,7 +1024,8 @@ deploy_site_files() {
     tmp="$(mktemp -d)"
     info "Скачиваю сайт: $SITE_ZIP_URL"
     if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$tmp/site.zip" "$SITE_ZIP_URL"; then
-        err "Не удалось скачать архив. Проверьте, что репозиторий публичный и файл ${SITE_ZIP_NAME} лежит в корне."
+        err "Не удалось скачать архив ${SITE_ZIP_NAME}."
+        err "Проверьте, что репозиторий публичный и файл лежит в его корне (или что ссылка верная)."
         rm -rf "$tmp"; return 1
     fi
     if ! unzip -q -o "$tmp/site.zip" -d "$tmp/x"; then
@@ -1090,6 +1151,7 @@ site_summary() {
     line
     echo -e "${GREEN}${BOLD}Сайт-заглушка установлен.${NC}"
     echo "  Домен:        $DOMAIN"
+    echo "  Шаблон:       ${SITE_ZIP_NAME}"
     echo "  Файлы сайта:  ${WEBROOT_BASE}/${DOMAIN}"
     echo "  Конфиг nginx: /etc/nginx/sites-available/${DOMAIN}.conf"
     echo "  Сертификат:   /etc/letsencrypt/live/${DOMAIN}/"
@@ -1170,7 +1232,19 @@ flow_site_only() {
 update_site_files() {
     load_state
     if [[ -z "$DOMAIN" ]]; then err "Сайт ещё не установлен"; return 1; fi
-    deploy_site_files && systemctl reload nginx && ok "Файлы сайта обновлены из GitHub"
+    resolve_site_url
+    echo
+    echo "  Сейчас установлен: ${SITE_ZIP_NAME}"
+    echo "  1) Обновить его из GitHub"
+    echo "  2) Сменить на другой сайт"
+    echo "  0) Назад"
+    local c; ask c "Выбор" "1"
+    case "$c" in
+        1) ;;
+        2) choose_site_template || return 1 ;;
+        *) return 0 ;;
+    esac
+    deploy_site_files && save_state && systemctl reload nginx && ok "Сайт ${SITE_ZIP_NAME} развёрнут для ${DOMAIN}"
 }
 
 uninstall_menu() {
@@ -1209,7 +1283,7 @@ uninstall_menu() {
             if confirm "Удалить также сертификат Let's Encrypt?" n; then
                 certbot delete --cert-name "$DOMAIN" --non-interactive
             fi
-            DOMAIN=""; SITE_MODE=""; SELFSTEAL_PORT=""
+            DOMAIN=""; SITE_MODE=""; SELFSTEAL_PORT=""; SITE_SOURCE=""
             save_state
             ok "Сайт удалён"
             ;;
@@ -1294,7 +1368,7 @@ show_menu() {
     echo "  2) Установить ноду + сайт-заглушку (nginx + SSL)"
     line
     echo "  3) Установить только сайт-заглушку"
-    echo "  4) Обновить файлы сайта из GitHub"
+    echo "  4) Обновить / сменить сайт-заглушку"
     echo "  5) Логи ноды"
     echo "  6) Обновить ноду"
     echo "  7) Ядро Xray (обновить / вернуть встроенное)"
