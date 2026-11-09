@@ -4,6 +4,8 @@
 #  1) Установка ноды Remnawave (по https://docs.rw/install/remnawave-node)
 #  2) Установка ноды + сайт-заглушка на nginx с SSL (Let's Encrypt)
 #  3) Установка / обновление ядра Xray-core на ноде
+#  4) Проброс сертификатов Let's Encrypt в ноду для gRPC/TLS inbound'ов
+#  5) Запуск установщика rkn-guard (Flecksis/rkn-guard)
 # =====================================================================
 
 set -o pipefail
@@ -30,14 +32,25 @@ DEFAULT_SELFSTEAL_PORT="9443"
 XRAY_DIR="/var/lib/remnanode"
 XRAY_BIN="${XRAY_DIR}/xray"
 OVERRIDE_FILE="${NODE_DIR}/docker-compose.override.yml"
-OVERRIDE_MARK="remnanode-installer: custom xray-core"
+OVERRIDE_MARK="remnanode-installer:"
 XRAY_RELEASES_API="https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100"
+
+# Сертификаты для gRPC/TLS: монтируем /etc/letsencrypt целиком (read-only).
+# Монтировать отдельные файлы из live/ нельзя: это симлинки на archive/,
+# и после продления сертификата контейнер продолжил бы видеть старый файл.
+LE_DIR="/etc/letsencrypt"
+RENEW_HOOK="${LE_DIR}/renewal-hooks/deploy/remnanode-restart.sh"
+DEFAULT_GRPC_PORT="8443"
+
+# Сторонний скрипт rkn-guard (https://github.com/Flecksis/rkn-guard)
+RKN_GUARD_URL="https://raw.githubusercontent.com/Flecksis/rkn-guard/master/install.sh"
 
 NODE_PORT=""
 DOMAIN=""
 EMAIL=""
 SITE_MODE=""          # selfsteal | public
 SELFSTEAL_PORT=""
+GRPC_DOMAIN=""        # домен, сертификат которого используется в ноде
 XRAY_VERSION=""
 
 # ------------------------------ Оформление ----------------------------
@@ -157,7 +170,18 @@ save_state() {
 DOMAIN="${DOMAIN}"
 SITE_MODE="${SITE_MODE}"
 SELFSTEAL_PORT="${SELFSTEAL_PORT}"
+GRPC_DOMAIN="${GRPC_DOMAIN}"
 EOF
+}
+
+normalize_domain() {
+    local d="${1,,}"
+    d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; d="${d// /}"
+    echo "$d"
+}
+
+valid_domain() {
+    [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]]
 }
 
 # ============================ DOCKER ==================================
@@ -265,6 +289,7 @@ EOF
     fi
     NODE_PORT="$(grep -oP 'NODE_PORT\s*[=:]\s*"?\K[0-9]+' "$COMPOSE_FILE" | head -1)"
     ok "Конфиг сохранён: $COMPOSE_FILE (NODE_PORT=${NODE_PORT:-не найден})"
+    certs_mounted && info "Сертификаты из ${LE_DIR} остаются проброшенными (через ${OVERRIDE_FILE})"
 }
 
 start_node() {
@@ -316,12 +341,85 @@ show_logs() {
     trap - INT
 }
 
+# ===================== docker-compose.override.yml ====================
+# Один override-файл управляет и своим ядром Xray, и сертификатами.
+# Основной docker-compose.yml (из панели) скрипт не трогает.
+
+# Имя сервиса ноды из основного docker-compose.yml (обычно remnanode)
+node_service() {
+    (cd "$NODE_DIR" && docker compose -f "$COMPOSE_FILE" config --services 2>/dev/null | head -1)
+}
+
+override_has()       { [[ -f "$OVERRIDE_FILE" ]] && grep -qF -- "$1" "$OVERRIDE_FILE"; }
+custom_core_active() { override_has ':/usr/local/bin/xray'; }
+custom_geo_active()  { override_has ':/usr/local/share/xray/geoip.dat'; }
+certs_mounted()      { override_has "${LE_DIR}:${LE_DIR}"; }
+
+# Если override написан не этим скриптом — спросить перед перезаписью
+check_foreign_override() {
+    if [[ -f "$OVERRIDE_FILE" ]] && ! grep -qF "$OVERRIDE_MARK" "$OVERRIDE_FILE"; then
+        warn "Найден ваш собственный $OVERRIDE_FILE — он будет перезаписан (с бэкапом)."
+        confirm "Продолжить?" n || return 1
+    fi
+    return 0
+}
+
+# write_override <своё_ядро 0|1> <geo-файлы 0|1> <сертификаты 0|1>
+write_override() {
+    local core="${1:-0}" geo="${2:-0}" certs="${3:-0}" svc bak=""
+    svc="$(node_service)"
+    if [[ -z "$svc" ]]; then
+        err "Не удалось определить сервис в $COMPOSE_FILE"
+        return 1
+    fi
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        bak="${OVERRIDE_FILE}.bak.$(date +%s)"
+        cp "$OVERRIDE_FILE" "$bak"
+    fi
+
+    if [[ "$core" != "1" && "$certs" != "1" ]]; then
+        rm -f "$OVERRIDE_FILE"
+        return 0
+    fi
+
+    {
+        echo "# ${OVERRIDE_MARK} managed override (xray-core / сертификаты)"
+        echo "# Файл создан Remnawave Node Installer. Удалите его и пересоздайте контейнер,"
+        echo "# чтобы вернуть ноду к конфигурации из docker-compose.yml."
+        echo "services:"
+        echo "  ${svc}:"
+        echo "    volumes:"
+        if [[ "$core" == "1" ]]; then
+            echo "      - ${XRAY_BIN}:/usr/local/bin/xray:ro"
+            if [[ "$geo" == "1" ]]; then
+                echo "      - ${XRAY_DIR}/geoip.dat:/usr/local/share/xray/geoip.dat:ro"
+                echo "      - ${XRAY_DIR}/geosite.dat:/usr/local/share/xray/geosite.dat:ro"
+            fi
+        fi
+        if [[ "$certs" == "1" ]]; then
+            echo "      - ${LE_DIR}:${LE_DIR}:ro"
+        fi
+    } >"$OVERRIDE_FILE"
+
+    if ! (cd "$NODE_DIR" && docker compose config -q); then
+        err "Итоговая конфигурация docker compose невалидна — откатываю override"
+        if [[ -n "$bak" ]]; then cp "$bak" "$OVERRIDE_FILE"; else rm -f "$OVERRIDE_FILE"; fi
+        return 1
+    fi
+}
+
+# Пересоздать контейнер (bind-mount подхватывается только так)
+recreate_node() {
+    local svc; svc="$(node_service)"
+    (cd "$NODE_DIR" && docker compose up -d --force-recreate) || return 1
+    sleep 5
+    (cd "$NODE_DIR" && docker compose ps --status running --services) | grep -qx "$svc"
+}
+
 # ============================ ЯДРО XRAY ===============================
 # Схема как в remnanode-xray-update.sh (DigneZzZ/remnawave-scripts):
 # бинарник лежит в /var/lib/remnanode/xray и монтируется в контейнер
-# поверх /usr/local/bin/xray. Монтирование задаётся в отдельном
-# docker-compose.override.yml — основной docker-compose.yml не трогаем,
-# а откат на встроенное ядро — это просто удаление override-файла.
+# поверх /usr/local/bin/xray.
 
 xray_arch() {
     case "$(uname -m)" in
@@ -336,15 +434,6 @@ xray_arch() {
     esac
 }
 
-# Имя сервиса ноды из основного docker-compose.yml (обычно remnanode)
-node_service() {
-    (cd "$NODE_DIR" && docker compose -f "$COMPOSE_FILE" config --services 2>/dev/null | head -1)
-}
-
-custom_core_active() {
-    [[ -f "$OVERRIDE_FILE" ]] && grep -q '/usr/local/bin/xray' "$OVERRIDE_FILE"
-}
-
 host_xray_version() {
     [[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}'
 }
@@ -356,7 +445,6 @@ container_xray_version() {
 }
 
 # Список релизов: "тег<TAB>prerelease<TAB>дата". $1 = 1 — включая pre-release.
-# XTLS помечает pre-release большинство релизов, поэтому берём 100 записей.
 fetch_xray_releases() {
     local json
     json="$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' "$XRAY_RELEASES_API")" || return 1
@@ -482,42 +570,6 @@ download_xray() {
     ok "Xray-core ${got} сохранён в ${XRAY_BIN}"
 }
 
-# $1 = 1 — монтировать и geoip.dat / geosite.dat из релиза Xray
-write_core_override() {
-    local svc; svc="$(node_service)"
-    if [[ -z "$svc" ]]; then
-        err "Не удалось определить сервис в $COMPOSE_FILE"
-        return 1
-    fi
-    [[ -f "$OVERRIDE_FILE" ]] && cp "$OVERRIDE_FILE" "${OVERRIDE_FILE}.bak.$(date +%s)"
-    {
-        echo "# ${OVERRIDE_MARK}"
-        echo "# Удалите этот файл и пересоздайте контейнер, чтобы вернуть встроенное ядро."
-        echo "services:"
-        echo "  ${svc}:"
-        echo "    volumes:"
-        echo "      - ${XRAY_BIN}:/usr/local/bin/xray:ro"
-        if [[ "${1:-0}" == "1" ]]; then
-            echo "      - ${XRAY_DIR}/geoip.dat:/usr/local/share/xray/geoip.dat:ro"
-            echo "      - ${XRAY_DIR}/geosite.dat:/usr/local/share/xray/geosite.dat:ro"
-        fi
-    } >"$OVERRIDE_FILE"
-
-    if ! (cd "$NODE_DIR" && docker compose config -q); then
-        err "Итоговая конфигурация docker compose невалидна — удаляю override"
-        rm -f "$OVERRIDE_FILE"
-        return 1
-    fi
-}
-
-# Пересоздать контейнер (bind-mount файла подхватывается только так)
-recreate_node() {
-    local svc; svc="$(node_service)"
-    (cd "$NODE_DIR" && docker compose up -d --force-recreate) || return 1
-    sleep 5
-    (cd "$NODE_DIR" && docker compose ps --status running --services) | grep -qx "$svc"
-}
-
 update_core() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
     if ! command -v jq >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
@@ -526,15 +578,13 @@ update_core() {
         apt_install curl unzip jq || { err "Не удалось установить jq/unzip"; return 1; }
     fi
 
-    local now src="встроенное в образ"
+    local now src="встроенное в образ" certs=0
     custom_core_active && src="своё, ${XRAY_BIN}"
+    certs_mounted && certs=1
     now="$(container_xray_version)"
     info "Сейчас в ноде: Xray ${now:-неизвестно} (${src})"
 
-    if [[ -f "$OVERRIDE_FILE" ]] && ! grep -q "$OVERRIDE_MARK" "$OVERRIDE_FILE"; then
-        warn "Найден ваш собственный $OVERRIDE_FILE — он будет перезаписан (с бэкапом)."
-        confirm "Продолжить?" n || return 0
-    fi
+    check_foreign_override || return 0
 
     choose_xray_version || { info "Отменено"; return 0; }
     download_xray "$XRAY_VERSION" || return 1
@@ -543,12 +593,12 @@ update_core() {
     echo
     info "В образе ноды уже есть geoip.dat / geosite.dat. Обычно их трогать не нужно."
     confirm "Заменить их файлами из релиза Xray ${XRAY_VERSION}?" n && geo=1
-    write_core_override "$geo" || return 1
+    write_override 1 "$geo" "$certs" || return 1
 
     info "Пересоздаю контейнер ноды..."
     if ! recreate_node; then
         err "Нода не поднялась с новым ядром — возвращаю встроенное"
-        rm -f "$OVERRIDE_FILE"
+        write_override 0 0 "$certs"
         recreate_node && warn "Нода запущена со встроенным ядром"
         (cd "$NODE_DIR" && docker compose logs --tail 30 -t)
         return 1
@@ -573,8 +623,8 @@ restore_bundled_core() {
         return 0
     fi
     confirm "Вернуть ядро, встроенное в образ ноды?" y || return 0
-    cp "$OVERRIDE_FILE" "${OVERRIDE_FILE}.bak.$(date +%s)"
-    rm -f "$OVERRIDE_FILE"
+    local certs=0; certs_mounted && certs=1
+    write_override 0 0 "$certs" || return 1
     info "Пересоздаю контейнер ноды..."
     if recreate_node; then
         ok "Нода работает со встроенным ядром: Xray $(container_xray_version)"
@@ -598,6 +648,198 @@ core_menu() {
     esac
 }
 
+# ===================== СЕРТИФИКАТЫ ДЛЯ gRPC ===========================
+cert_exists() {
+    [[ -f "${LE_DIR}/live/$1/fullchain.pem" && -f "${LE_DIR}/live/$1/privkey.pem" ]]
+}
+
+# Получить сертификат для домена ноды (без сайта-заглушки).
+# Если 80-й порт держит nginx — используем webroot (продление тоже через nginx),
+# если порт свободен — standalone (certbot сам поднимает сервер на 80).
+obtain_node_certificate() {
+    local d="$1" owner email_args=(--register-unsafely-without-email)
+    apt_install certbot || { err "Не удалось установить certbot"; return 1; }
+
+    [[ -z "$EMAIL" ]] && ask EMAIL "Email для Let's Encrypt (Enter — без email)" ""
+    [[ -n "$EMAIL" ]] && email_args=(-m "$EMAIL")
+
+    owner="$(port_owner 80)"
+    if [[ "$owner" == "nginx " ]]; then
+        mkdir -p "$ACME_ROOT"
+        if [[ ! -f "/etc/nginx/sites-available/${d}.conf" ]]; then
+            info "Добавляю в nginx обработку ACME-проверок для $d"
+            cat >"/etc/nginx/sites-available/acme-${d}.conf" <<EOF
+server {
+    listen 80;
+    server_name ${d};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+        default_type "text/plain";
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+            ln -sf "/etc/nginx/sites-available/acme-${d}.conf" "/etc/nginx/sites-enabled/acme-${d}.conf"
+            nginx -t && systemctl reload nginx || { err "nginx не принял конфиг"; return 1; }
+        fi
+        certbot certonly --webroot -w "$ACME_ROOT" -d "$d" \
+            --agree-tos --non-interactive --keep-until-expiring "${email_args[@]}" || {
+            err "Не удалось получить сертификат. Проверьте DNS и доступность порта 80 извне."
+            return 1
+        }
+    elif [[ -n "$owner" ]]; then
+        err "Порт 80 занят процессом: $owner — он нужен для получения сертификата"
+        return 1
+    else
+        certbot certonly --standalone --preferred-challenges http -d "$d" \
+            --agree-tos --non-interactive --keep-until-expiring "${email_args[@]}" || {
+            err "Не удалось получить сертификат. Проверьте DNS и доступность порта 80 извне."
+            return 1
+        }
+        warn "Сертификат получен в режиме standalone: для автопродления порт 80 должен быть открыт снаружи."
+    fi
+    systemctl enable --now certbot.timer >/dev/null 2>&1
+    ok "Сертификат для $d получен"
+}
+
+# После продления сертификата перезапускаем ноду, чтобы Xray перечитал файлы
+install_renew_hook() {
+    mkdir -p "$(dirname "$RENEW_HOOK")"
+    cat >"$RENEW_HOOK" <<EOF
+#!/bin/sh
+# remnanode-installer: перезапуск ноды после продления сертификата для gRPC
+. ${STATE_FILE} 2>/dev/null
+[ -n "\$GRPC_DOMAIN" ] || exit 0
+case "\$RENEWED_LINEAGE" in
+    */live/"\$GRPC_DOMAIN") ;;
+    *) exit 0 ;;
+esac
+cd ${NODE_DIR} 2>/dev/null && docker compose restart >/dev/null 2>&1 || docker restart remnanode >/dev/null 2>&1
+exit 0
+EOF
+    chmod 755 "$RENEW_HOOK"
+}
+
+grpc_hint() {
+    local d="${1:-$GRPC_DOMAIN}"
+    [[ -z "$d" ]] && return 0
+    line
+    echo -e "${BOLD}Пути к сертификатам внутри контейнера ноды:${NC}"
+    echo "  certificateFile: ${LE_DIR}/live/${d}/fullchain.pem"
+    echo "  keyFile:         ${LE_DIR}/live/${d}/privkey.pem"
+    line
+    echo -e "${BOLD}Пример gRPC inbound для Config Profile в панели Remnawave:${NC}"
+    cat <<EOF
+{
+  "tag": "VLESS_GRPC_TLS",
+  "port": ${DEFAULT_GRPC_PORT},
+  "listen": "0.0.0.0",
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "grpc",
+    "grpcSettings": { "serviceName": "grpc" },
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "${d}",
+      "alpn": ["h2"],
+      "certificates": [
+        {
+          "certificateFile": "${LE_DIR}/live/${d}/fullchain.pem",
+          "keyFile": "${LE_DIR}/live/${d}/privkey.pem"
+        }
+      ]
+    }
+  }
+}
+EOF
+    echo -e "${DIM}Порт ${DEFAULT_GRPC_PORT} — пример; не используйте порт, занятый Reality (443) или nginx.${NC}"
+    echo -e "${DIM}После продления сертификата нода перезапускается автоматически (${RENEW_HOOK}).${NC}"
+    line
+}
+
+# setup_grpc_certs [домен_по_умолчанию]
+setup_grpc_certs() {
+    local def="${1:-$GRPC_DOMAIN}" d core=0 geo=0 dflt="n"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    [[ -n "$def" ]] && dflt="y"
+
+    echo
+    confirm "Пробросить в ноду сертификаты Let's Encrypt (для gRPC/TLS inbound'ов)?" "$dflt" || return 0
+    check_foreign_override || return 0
+
+    ask d "Домен сертификата" "$def"
+    d="$(normalize_domain "$d")"
+    if ! valid_domain "$d"; then err "Некорректный домен: '$d'"; return 1; fi
+
+    if ! cert_exists "$d"; then
+        warn "Сертификата для $d в ${LE_DIR}/live/ нет."
+        confirm "Получить его сейчас через Let's Encrypt?" y || return 1
+        check_dns "$d" || return 1
+        obtain_node_certificate "$d" || return 1
+    else
+        ok "Сертификат найден: ${LE_DIR}/live/${d}/"
+    fi
+
+    GRPC_DOMAIN="$d"
+    save_state
+    install_renew_hook
+
+    if certs_mounted; then
+        ok "${LE_DIR} уже проброшен в контейнер — пересоздавать ноду не нужно"
+    else
+        custom_core_active && core=1
+        custom_geo_active && geo=1
+        write_override "$core" "$geo" 1 || return 1
+        info "Пересоздаю контейнер ноды..."
+        if ! recreate_node; then
+            err "Нода не поднялась после монтирования сертификатов — откатываю"
+            write_override "$core" "$geo" 0
+            recreate_node
+            (cd "$NODE_DIR" && docker compose logs --tail 30 -t)
+            return 1
+        fi
+        ok "Сертификаты проброшены в контейнер: ${LE_DIR} → ${LE_DIR} (только чтение)"
+    fi
+    grpc_hint "$d"
+}
+
+remove_grpc_certs() {
+    if ! certs_mounted; then info "Сертификаты в ноду не проброшены"; return 0; fi
+    warn "Если в Config Profile есть inbound'ы с этими сертификатами, Xray не запустится."
+    confirm "Убрать сертификаты из контейнера ноды?" n || return 0
+    local core=0 geo=0
+    custom_core_active && core=1
+    custom_geo_active && geo=1
+    write_override "$core" "$geo" 0 || return 1
+    GRPC_DOMAIN=""
+    save_state
+    rm -f "$RENEW_HOOK"
+    info "Пересоздаю контейнер ноды..."
+    recreate_node && ok "Сертификаты убраны из ноды" || err "Контейнер не запустился — проверьте логи"
+}
+
+certs_menu() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    load_state
+    echo
+    echo "  1) Пробросить сертификаты / сменить домен"
+    echo "  2) Показать пути и пример gRPC inbound"
+    echo "  3) Убрать сертификаты из ноды"
+    echo "  0) Назад"
+    local c; ask c "Выбор" "1"
+    case "$c" in
+        1) setup_grpc_certs "${GRPC_DOMAIN:-$DOMAIN}" ;;
+        2) if [[ -n "$GRPC_DOMAIN" ]]; then grpc_hint; else info "Сертификаты ещё не настроены"; fi ;;
+        3) remove_grpc_certs ;;
+    esac
+}
+
 # ============================ ФАЕРВОЛ =================================
 detect_ssh_port() {
     local p
@@ -606,7 +848,8 @@ detect_ssh_port() {
 }
 
 setup_firewall() {
-    local need_http="${1:-0}"
+    local need_http="${1:-0}" def_ports="443"
+    [[ -n "$GRPC_DOMAIN" ]] && def_ports="443 ${DEFAULT_GRPC_PORT}"
     echo
     confirm "Настроить фаервол UFW (порт ноды будет открыт только для IP панели)?" n || return 0
 
@@ -618,7 +861,7 @@ setup_firewall() {
     if [[ -z "$panel_ip" ]]; then err "IP панели не указан — пропускаю настройку UFW"; return 1; fi
     ssh_port="$(detect_ssh_port)"
     ask ssh_port "SSH-порт (не ошибитесь, иначе потеряете доступ!)" "$ssh_port"
-    ask extra "Публичные порты inbound'ов Xray через пробел" "443"
+    ask extra "Публичные порты inbound'ов Xray через пробел" "$def_ports"
 
     apt_install ufw || { err "Не удалось установить ufw"; return 1; }
     ufw allow "${ssh_port}/tcp" >/dev/null
@@ -634,16 +877,10 @@ setup_firewall() {
 }
 
 # ============================ САЙТ ====================================
-normalize_domain() {
-    local d="${1,,}"
-    d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; d="${d// /}"
-    echo "$d"
-}
-
 ask_site_params() {
     ask DOMAIN "Домен для сайта (например site.example.com)"
     DOMAIN="$(normalize_domain "$DOMAIN")"
-    if ! [[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]]; then
+    if ! valid_domain "$DOMAIN"; then
         err "Некорректный домен: '$DOMAIN'"
         return 1
     fi
@@ -669,19 +906,20 @@ ask_site_params() {
     esac
 }
 
+# check_dns [домен]  (по умолчанию — $DOMAIN)
 check_dns() {
-    local sip dips
+    local d="${1:-$DOMAIN}" sip dips
     sip="$(get_server_ip)"
-    dips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u)"
+    dips="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)"
     if [[ -z "$dips" ]]; then
-        warn "Домен $DOMAIN не резолвится. Создайте A-запись на IP ${sip}."
+        warn "Домен $d не резолвится. Создайте A-запись на IP ${sip}."
         confirm "Всё равно продолжить?" n || return 1
     elif ! grep -qx "$sip" <<<"$dips"; then
         warn "Домен указывает на: $(echo $dips) — а IP этого сервера: ${sip}"
         warn "Если используете Cloudflare — выключите проксирование (серое облако)."
         confirm "Всё равно продолжить?" n || return 1
     else
-        ok "DNS в порядке: $DOMAIN → $sip"
+        ok "DNS в порядке: $d → $sip"
     fi
 }
 
@@ -754,6 +992,8 @@ deploy_site_files() {
 
 write_nginx_http_only() {
     local v6=""; has_ipv6 && v6="    listen [::]:80;"
+    # Временный ACME-конфиг для этого домена больше не нужен
+    rm -f "/etc/nginx/sites-enabled/acme-${DOMAIN}.conf" "/etc/nginx/sites-available/acme-${DOMAIN}.conf"
     cat >"/etc/nginx/sites-available/${DOMAIN}.conf" <<EOF
 server {
     listen 80;
@@ -906,7 +1146,8 @@ flow_node() {
     install_docker       || return 1
     configure_node       || return 1
     start_node           || return 1
-    setup_firewall 0
+    setup_grpc_certs "$GRPC_DOMAIN"
+    if [[ -n "$GRPC_DOMAIN" ]]; then setup_firewall 1; else setup_firewall 0; fi
     node_finish_hint
 }
 
@@ -916,6 +1157,7 @@ flow_node_and_site() {
     configure_node       || return 1
     start_node           || return 1
     install_site         || return 1
+    setup_grpc_certs "$DOMAIN"
     setup_firewall 1
     node_finish_hint
 }
@@ -932,6 +1174,7 @@ update_site_files() {
 }
 
 uninstall_menu() {
+    load_state
     echo
     echo "  1) Удалить ноду Remnawave"
     echo "  2) Удалить сайт-заглушку"
@@ -942,6 +1185,9 @@ uninstall_menu() {
             confirm "Точно удалить ноду (контейнер и ${NODE_DIR})?" n || return 0
             if [[ -f "$COMPOSE_FILE" ]]; then (cd "$NODE_DIR" && docker compose down); fi
             rm -rf "$NODE_DIR"
+            rm -f "$RENEW_HOOK"
+            GRPC_DOMAIN=""
+            save_state
             if [[ -f "$XRAY_BIN" ]] && confirm "Удалить также своё ядро Xray (${XRAY_DIR})?" y; then
                 rm -f "$XRAY_BIN" "${XRAY_BIN}.prev" "${XRAY_DIR}/geoip.dat" "${XRAY_DIR}/geosite.dat"
                 rmdir "$XRAY_DIR" 2>/dev/null
@@ -949,25 +1195,67 @@ uninstall_menu() {
             ok "Нода удалена"
             ;;
         2)
-            load_state
             if [[ -z "$DOMAIN" ]]; then ask DOMAIN "Домен сайта для удаления"; fi
             [[ -z "$DOMAIN" ]] && return 1
             confirm "Удалить сайт $DOMAIN (конфиг nginx и файлы)?" n || return 0
             rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf" "/etc/nginx/sites-available/${DOMAIN}.conf"
             rm -rf "${WEBROOT_BASE:?}/${DOMAIN}"
             nginx -t >/dev/null 2>&1 && systemctl reload nginx
+            if [[ "$GRPC_DOMAIN" == "$DOMAIN" ]]; then
+                warn "Сертификат $DOMAIN используется нодой для gRPC — удалять его не рекомендуется."
+                warn "Без сайта продление пойдёт через webroot nginx и может перестать работать:"
+                warn "перенастройте сертификат через пункт «Сертификаты для gRPC»."
+            fi
             if confirm "Удалить также сертификат Let's Encrypt?" n; then
                 certbot delete --cert-name "$DOMAIN" --non-interactive
             fi
-            rm -f "$STATE_FILE"
+            DOMAIN=""; SITE_MODE=""; SELFSTEAL_PORT=""
+            save_state
             ok "Сайт удалён"
             ;;
     esac
 }
 
+# ============================ RKN-GUARD ================================
+# Скрипт сначала скачивается во временный файл, а не передаётся через
+# «curl | bash»: так у него остаётся терминал для вопросов, а при обрыве
+# загрузки не выполнится недокачанный кусок.
+run_rkn_guard() {
+    line
+    echo -e "${BOLD}rkn-guard${NC} — сторонний скрипт: ${RKN_GUARD_URL}"
+    warn "Он будет запущен от root. Запускайте, только если доверяете автору репозитория."
+    line
+    confirm "Запустить установку rkn-guard?" n || return 0
+
+    local tmp
+    tmp="$(mktemp -d)"
+    info "Скачиваю install.sh..."
+    if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$tmp/install.sh" "$RKN_GUARD_URL"; then
+        err "Не удалось скачать $RKN_GUARD_URL"
+        rm -rf "$tmp"; return 1
+    fi
+    if [[ ! -s "$tmp/install.sh" ]]; then
+        err "Скачан пустой файл"
+        rm -rf "$tmp"; return 1
+    fi
+
+    info "Запускаю: install.sh install"
+    line
+    bash "$tmp/install.sh" install </dev/tty
+    local rc=$?
+    line
+    rm -rf "$tmp"
+    if (( rc == 0 )); then
+        ok "rkn-guard: установка завершена"
+    else
+        err "rkn-guard завершился с кодом $rc"
+        return 1
+    fi
+}
+
 # ============================ МЕНЮ ====================================
 status_line() {
-    local node_st site_st core_st
+    local node_st site_st core_st cert_st
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
         node_st="${GREEN}работает${NC}"
     elif [[ -f "$COMPOSE_FILE" ]]; then
@@ -984,7 +1272,12 @@ status_line() {
         else
             core_st="${DIM}встроенное в образ${NC}"
         fi
-        echo -e "  Ядро Xray: ${core_st}"
+        if certs_mounted; then
+            cert_st="${GREEN}${GRPC_DOMAIN:-проброшены}${NC}"
+        else
+            cert_st="${DIM}нет${NC}"
+        fi
+        echo -e "  Ядро Xray: ${core_st}    Сертификаты gRPC: ${cert_st}"
     fi
 }
 
@@ -1005,7 +1298,9 @@ show_menu() {
     echo "  5) Логи ноды"
     echo "  6) Обновить ноду"
     echo "  7) Ядро Xray (обновить / вернуть встроенное)"
-    echo "  8) Удаление"
+    echo "  8) Сертификаты для gRPC (проброс в ноду)"
+    echo "  9) Установить rkn-guard"
+    echo " 10) Удаление"
     echo "  0) Выход"
     line
 }
@@ -1013,6 +1308,7 @@ show_menu() {
 main() {
     check_root
     check_os
+    load_state
     while true; do
         show_menu
         local choice; ask choice "Выберите пункт"
@@ -1024,7 +1320,9 @@ main() {
             5) show_logs;          pause ;;
             6) update_node;        pause ;;
             7) core_menu;          pause ;;
-            8) uninstall_menu;     pause ;;
+            8) certs_menu;         pause ;;
+            9) run_rkn_guard;      pause ;;
+            10) uninstall_menu;    pause ;;
             0) echo "Пока!"; exit 0 ;;
             *) warn "Нет такого пункта"; sleep 1 ;;
         esac
