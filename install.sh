@@ -314,6 +314,7 @@ start_node() {
     else
         err "Контейнер не запущен. Последние логи:"
         docker compose logs --tail 50 -t
+        [[ -f "$OVERRIDE_FILE" ]] && warn "Используется также ${OVERRIDE_FILE} — проверьте и его."
         return 1
     fi
     echo; info "Последние строки логов:"
@@ -772,9 +773,11 @@ EOF
     line
 }
 
-# setup_grpc_certs [домен_по_умолчанию]
+# setup_grpc_certs [домен_по_умолчанию] [defer]
+# defer=1 — нода ещё не запущена: только пишем override, контейнер
+# не пересоздаём (монтирование применится при первом запуске ноды).
 setup_grpc_certs() {
-    local def="${1:-$GRPC_DOMAIN}" d core=0 geo=0 dflt="n"
+    local def="${1:-$GRPC_DOMAIN}" defer="${2:-0}" d core=0 geo=0 dflt="n"
     if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
     [[ -n "$def" ]] && dflt="y"
 
@@ -801,6 +804,11 @@ setup_grpc_certs() {
 
     if certs_mounted; then
         ok "${LE_DIR} уже проброшен в контейнер — пересоздавать ноду не нужно"
+    elif [[ "$defer" == "1" ]]; then
+        custom_core_active && core=1
+        custom_geo_active && geo=1
+        write_override "$core" "$geo" 1 || return 1
+        ok "Монтирование ${LE_DIR} добавлено в ${OVERRIDE_FILE} — применится при запуске ноды"
     else
         custom_core_active && core=1
         custom_geo_active && geo=1
@@ -1203,13 +1211,16 @@ install_site() {
 }
 
 # ============================ СЦЕНАРИИ ================================
+# Нода запускается последним шагом: к этому моменту уже готовы
+# сайт, сертификаты (и их монтирование в override) и фаервол,
+# поэтому контейнер стартует сразу с итоговой конфигурацией.
 flow_node() {
     ensure_base_packages || return 1
     install_docker       || return 1
     configure_node       || return 1
-    start_node           || return 1
-    setup_grpc_certs "$GRPC_DOMAIN"
+    setup_grpc_certs "$GRPC_DOMAIN" 1
     if [[ -n "$GRPC_DOMAIN" ]]; then setup_firewall 1; else setup_firewall 0; fi
+    start_node           || return 1
     node_finish_hint
 }
 
@@ -1217,10 +1228,13 @@ flow_node_and_site() {
     ensure_base_packages || return 1
     install_docker       || return 1
     configure_node       || return 1
-    start_node           || return 1
-    install_site         || return 1
-    setup_grpc_certs "$DOMAIN"
+    if ! install_site; then
+        warn "Сайт-заглушку установить не удалось (см. ошибки выше)."
+        confirm "Продолжить установку ноды без сайта?" y || return 1
+    fi
+    setup_grpc_certs "${DOMAIN:-$GRPC_DOMAIN}" 1
     setup_firewall 1
+    start_node           || return 1
     node_finish_hint
 }
 
