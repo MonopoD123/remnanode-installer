@@ -4,9 +4,11 @@
 #  1) Установка ноды Remnawave (по https://docs.rw/install/remnawave-node)
 #  2) Установка ноды + сайт-заглушка на nginx с SSL (Let's Encrypt)
 #     (на выбор: «Радио», игра «Курятник» или свой zip)
-#  3) Установка / обновление ядра Xray-core на ноде
-#  4) Проброс сертификатов Let's Encrypt в ноду для gRPC/TLS inbound'ов
-#  5) Запуск установщика rkn-guard (Flecksis/rkn-guard)
+#  3) Selfsteal Reality: сайт-заглушка + готовый Config Profile для панели
+#     со случайными портами (каждый запуск — новый порт для Hosts)
+#  4) Установка / обновление ядра Xray-core на ноде
+#  5) Проброс сертификатов Let's Encrypt в ноду для gRPC/TLS inbound'ов
+#  6) Запуск установщика rkn-guard (Flecksis/rkn-guard)
 # =====================================================================
 
 set -o pipefail
@@ -34,6 +36,14 @@ ACME_ROOT="/var/www/letsencrypt"
 STATE_FILE="/etc/remnanode-installer.conf"
 DEFAULT_SELFSTEAL_PORT="9443"
 
+# Selfsteal Reality: готовые конфиги для панели и диапазоны случайных портов
+SELFSTEAL_CFG_DIR="/opt/remnanode-selfsteal"
+LOCAL_PORT_MIN=10000          # локальный порт nginx (Reality target)
+LOCAL_PORT_MAX=19999
+REALITY_PORT_MIN=20000        # публичный порт inbound'а = порт в Hosts
+REALITY_PORT_MAX=60000
+XRAY_IMAGE="ghcr.io/xtls/xray-core:latest"
+
 # Своё ядро Xray: бинарник на хосте + docker-compose.override.yml,
 # который монтирует его в контейнер поверх встроенного в образ.
 XRAY_DIR="/var/lib/remnanode"
@@ -56,10 +66,15 @@ NODE_PORT=""
 DOMAIN=""
 EMAIL=""
 SITE_MODE=""          # selfsteal | public
+SITE_MODE_PRESET=""   # если задан — режим сайта не спрашивается
 SELFSTEAL_PORT=""
 GRPC_DOMAIN=""        # домен, сертификат которого используется в ноде
 SITE_SOURCE=""        # radio.zip | eggs.zip | URL своего архива
 XRAY_VERSION=""
+REALITY_PORTS=""      # все выданные порты inbound'ов (чтобы не повторялись)
+REALITY_PORT=""
+REALITY_PRIV=""
+REALITY_PUB=""
 
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
@@ -167,6 +182,25 @@ port_owner() {
         | grep -oP 'users:\(\("\K[^"]+' | sort -u | tr '\n' ' '
 }
 
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# Порт занят процессом или уже выдан этим скриптом
+port_taken() {
+    local p="$1"
+    [[ -n "$(port_owner "$p")" ]] && return 0
+    [[ " ${REALITY_PORTS} ${SELFSTEAL_PORT} ${NODE_PORT} ${DEFAULT_GRPC_PORT} 80 443 " == *" ${p} "* ]]
+}
+
+# random_free_port MIN MAX — случайный свободный порт, не выдававшийся ранее
+random_free_port() {
+    local min="$1" max="$2" p i
+    for ((i = 0; i < 200; i++)); do
+        p="$(shuf -i "${min}-${max}" -n 1)"
+        port_taken "$p" || { echo "$p"; return 0; }
+    done
+    return 1
+}
+
 load_state() {
     # shellcheck source=/dev/null
     [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"
@@ -180,7 +214,9 @@ SITE_MODE="${SITE_MODE}"
 SELFSTEAL_PORT="${SELFSTEAL_PORT}"
 GRPC_DOMAIN="${GRPC_DOMAIN}"
 SITE_SOURCE="${SITE_SOURCE}"
+REALITY_PORTS="${REALITY_PORTS}"
 EOF
+    chmod 600 "$STATE_FILE"
 }
 
 normalize_domain() {
@@ -192,6 +228,12 @@ normalize_domain() {
 valid_domain() {
     [[ "$1" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]]
 }
+
+get_node_port() {
+    [[ -f "$COMPOSE_FILE" ]] && grep -oP 'NODE_PORT\s*[=:]\s*"?\K[0-9]+' "$COMPOSE_FILE" | head -1
+}
+
+ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; }
 
 # ============================ DOCKER ==================================
 install_docker() {
@@ -220,7 +262,7 @@ configure_node() {
         warn "Уже есть конфиг: $COMPOSE_FILE"
         if ! confirm "Перезаписать его?" n; then
             info "Оставляю существующий docker-compose.yml"
-            NODE_PORT="$(grep -oP 'NODE_PORT\s*[=:]\s*"?\K[0-9]+' "$COMPOSE_FILE" | head -1)"
+            NODE_PORT="$(get_node_port)"
             return 0
         fi
         cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
@@ -255,7 +297,7 @@ configure_node() {
         2)
             local port key
             ask port "NODE_PORT (порт из формы в панели)" "2222"
-            if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+            if ! valid_port "$port"; then
                 err "Некорректный порт: $port"
                 return 1
             fi
@@ -296,7 +338,7 @@ EOF
         err "docker-compose.yml содержит ошибку (см. выше). Проверьте вставленный текст."
         return 1
     fi
-    NODE_PORT="$(grep -oP 'NODE_PORT\s*[=:]\s*"?\K[0-9]+' "$COMPOSE_FILE" | head -1)"
+    NODE_PORT="$(get_node_port)"
     ok "Конфиг сохранён: $COMPOSE_FILE (NODE_PORT=${NODE_PORT:-не найден})"
     certs_mounted && info "Сертификаты из ${LE_DIR} остаются проброшенными (через ${OVERRIDE_FILE})"
 }
@@ -768,7 +810,7 @@ grpc_hint() {
   }
 }
 EOF
-    echo -e "${DIM}Порт ${DEFAULT_GRPC_PORT} — пример; не используйте порт, занятый Reality (443) или nginx.${NC}"
+    echo -e "${DIM}Порт ${DEFAULT_GRPC_PORT} — пример; не используйте порт, занятый Reality или nginx.${NC}"
     echo -e "${DIM}После продления сертификата нода перезапускается автоматически (${RENEW_HOOK}).${NC}"
     line
 }
@@ -866,7 +908,8 @@ detect_ssh_port() {
 
 setup_firewall() {
     local need_http="${1:-0}" def_ports="443"
-    [[ -n "$GRPC_DOMAIN" ]] && def_ports="443 ${DEFAULT_GRPC_PORT}"
+    [[ -n "$REALITY_PORTS" ]] && def_ports="$REALITY_PORTS"
+    [[ -n "$GRPC_DOMAIN" ]] && def_ports+=" ${DEFAULT_GRPC_PORT}"
     echo
     confirm "Настроить фаервол UFW (порт ноды будет открыт только для IP панели)?" n || return 0
 
@@ -894,6 +937,16 @@ setup_firewall() {
 }
 
 # ============================ САЙТ ====================================
+# Локальный порт nginx для Reality target: по умолчанию — случайный
+ask_selfsteal_port() {
+    local rnd
+    rnd="$(random_free_port "$LOCAL_PORT_MIN" "$LOCAL_PORT_MAX")" || rnd="$DEFAULT_SELFSTEAL_PORT"
+    ask SELFSTEAL_PORT "Локальный порт nginx для Reality target (случайный)" "$rnd"
+    if ! valid_port "$SELFSTEAL_PORT"; then
+        err "Некорректный порт"; return 1
+    fi
+}
+
 ask_site_params() {
     ask DOMAIN "Домен для сайта (например site.example.com)"
     DOMAIN="$(normalize_domain "$DOMAIN")"
@@ -905,6 +958,12 @@ ask_site_params() {
 
     choose_site_template || return 1
 
+    if [[ "$SITE_MODE_PRESET" == "selfsteal" ]]; then
+        SITE_MODE="selfsteal"
+        ask_selfsteal_port || return 1
+        return 0
+    fi
+
     echo
     echo "Режим работы сайта:"
     echo "  1) Selfsteal для Reality — nginx слушает только 127.0.0.1, порт 443 занимает Xray"
@@ -913,13 +972,7 @@ ask_site_params() {
     local m
     ask m "Выбор" "1"
     case "$m" in
-        1)
-            SITE_MODE="selfsteal"
-            ask SELFSTEAL_PORT "Локальный порт nginx для Reality target" "$DEFAULT_SELFSTEAL_PORT"
-            if ! [[ "$SELFSTEAL_PORT" =~ ^[0-9]+$ ]] || (( SELFSTEAL_PORT < 1 || SELFSTEAL_PORT > 65535 )); then
-                err "Некорректный порт"; return 1
-            fi
-            ;;
+        1) SITE_MODE="selfsteal"; ask_selfsteal_port || return 1 ;;
         2) SITE_MODE="public"; SELFSTEAL_PORT="" ;;
         *) err "Неверный выбор"; return 1 ;;
     esac
@@ -953,6 +1006,7 @@ choose_site_template() {
     for i in "${!SITE_TEMPLATES[@]}"; do
         echo -e "  $((i + 1))) ${SITE_TEMPLATE_TITLES[$i]}  ${DIM}(${SITE_TEMPLATES[$i]})${NC}"
     done
+    echo "  r) Случайный из списка"
     echo "  u) Свой zip-архив по ссылке"
     ask c "Выбор" "$def"
     case "${c,,}" in
@@ -960,6 +1014,9 @@ choose_site_template() {
             ask url "Прямая ссылка на .zip (https://...)"
             if [[ ! "$url" =~ ^https?:// ]]; then err "Нужна ссылка вида https://..."; return 1; fi
             SITE_SOURCE="$url"
+            ;;
+        r)
+            SITE_SOURCE="${SITE_TEMPLATES[$((RANDOM % ${#SITE_TEMPLATES[@]}))]}"
             ;;
         *)
             if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SITE_TEMPLATES[@]} )); then
@@ -1164,33 +1221,12 @@ site_summary() {
     echo "  Конфиг nginx: /etc/nginx/sites-available/${DOMAIN}.conf"
     echo "  Сертификат:   /etc/letsencrypt/live/${DOMAIN}/"
     if [[ "$SITE_MODE" == "selfsteal" ]]; then
-        echo "  nginx слушает: 127.0.0.1:${SELFSTEAL_PORT} (снаружи сайт доступен через Xray на 443)"
+        echo "  nginx слушает: 127.0.0.1:${SELFSTEAL_PORT} (снаружи сайт доступен через Xray)"
+        # В сценарии Selfsteal готовый конфиг генерируется следующим шагом
+        [[ "$SITE_MODE_PRESET" == "selfsteal" ]] && { line; return 0; }
         line
-        echo -e "${BOLD}Пример inbound для Config Profile в панели Remnawave:${NC}"
-        cat <<EOF
-{
-  "tag": "VLESS_REALITY_SELFSTEAL",
-  "port": 443,
-  "listen": "0.0.0.0",
-  "protocol": "vless",
-  "settings": { "clients": [], "decryption": "none" },
-  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "show": false,
-      "xver": 0,
-      "target": "127.0.0.1:${SELFSTEAL_PORT}",
-      "spiderX": "",
-      "shortIds": [""],
-      "privateKey": "СГЕНЕРИРУЙТЕ_КЛЮЧ_В_ПАНЕЛИ",
-      "serverNames": ["${DOMAIN}"]
-    }
-  }
-}
-EOF
-        echo -e "${DIM}Пока в профиле ноды нет inbound на 443, сайт по https://${DOMAIN} открываться не будет — это нормально.${NC}"
+        echo -e "${BOLD}Готовый Config Profile со случайным портом и ключами:${NC}"
+        echo "  пункт «Selfsteal Reality» → «Новый конфиг для Hosts»"
     else
         echo "  Проверьте: https://${DOMAIN}"
     fi
@@ -1208,6 +1244,242 @@ install_site() {
     write_nginx_ssl     || return 1
     save_state
     site_summary
+}
+
+# ======================= SELFSTEAL REALITY ============================
+# Ключи x25519: из работающей ноды → из своего ядра → из образа Xray.
+# Старый вывод xray: "Private key / Public key",
+# новый: "PrivateKey / Password" (Password = публичный ключ).
+gen_reality_keys() {
+    local out=""
+    REALITY_PRIV=""; REALITY_PUB=""
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
+        out="$(docker exec remnanode xray x25519 2>/dev/null)"
+    fi
+    if [[ -z "$out" && -x "$XRAY_BIN" ]]; then
+        out="$("$XRAY_BIN" x25519 2>/dev/null)"
+    fi
+    if [[ -z "$out" ]] && command -v docker >/dev/null 2>&1; then
+        info "Генерирую ключи x25519 через образ ${XRAY_IMAGE}..."
+        out="$(docker run --rm "$XRAY_IMAGE" x25519 2>/dev/null)"
+    fi
+    REALITY_PRIV="$(awk -F':' 'tolower($1) ~ /^private ?key/ {print $2; exit}' <<<"$out")"
+    REALITY_PUB="$(awk -F':' 'tolower($1) ~ /^(public ?key|password)/ {print $2; exit}' <<<"$out")"
+    REALITY_PRIV="${REALITY_PRIV//[[:space:]]/}"
+    REALITY_PUB="${REALITY_PUB//[[:space:]]/}"
+    [[ -n "$REALITY_PRIV" ]]
+}
+
+gen_short_id() {
+    od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# make_inbound_json TAG PORT PRIVKEY SHORTID SNI TARGET
+make_inbound_json() {
+    cat <<EOF
+{
+  "tag": "$1",
+  "port": $2,
+  "listen": "0.0.0.0",
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "xver": 0,
+      "target": "$6",
+      "spiderX": "",
+      "shortIds": ["$4"],
+      "privateKey": "$3",
+      "serverNames": ["$5"]
+    }
+  }
+}
+EOF
+}
+
+# make_profile_json "<inbound json>"
+make_profile_json() {
+    local inb
+    inb="$(sed 's/^/    /' <<<"$1")"
+    cat <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+${inb}
+  ],
+  "outbounds": [
+    { "tag": "DIRECT", "protocol": "freedom" },
+    { "tag": "BLOCK", "protocol": "blackhole" }
+  ],
+  "routing": {
+    "rules": [
+      { "ip": ["geoip:private"], "outboundTag": "BLOCK" },
+      { "protocol": ["bittorrent"], "outboundTag": "BLOCK" }
+    ]
+  }
+}
+EOF
+}
+
+# Выбор публичного порта inbound'а (= порт в Hosts). По умолчанию — случайный.
+choose_reality_port() {
+    local rnd c owner
+    NODE_PORT="${NODE_PORT:-$(get_node_port)}"
+    rnd="$(random_free_port "$REALITY_PORT_MIN" "$REALITY_PORT_MAX")" || {
+        err "Не удалось подобрать свободный порт"; return 1; }
+    echo
+    echo "Порт inbound'а (его же указываете в Hosts панели):"
+    echo -e "  1) Случайный: ${GREEN}${rnd}${NC}"
+    echo "  2) 443 (стандартный HTTPS)"
+    echo "  3) Указать вручную"
+    ask c "Выбор" "1"
+    case "$c" in
+        1) REALITY_PORT="$rnd" ;;
+        2) REALITY_PORT="443" ;;
+        3)
+            ask REALITY_PORT "Порт"
+            valid_port "$REALITY_PORT" || { err "Некорректный порт"; return 1; }
+            ;;
+        *) err "Неверный выбор"; return 1 ;;
+    esac
+    if [[ " ${REALITY_PORTS} " == *" ${REALITY_PORT} "* ]]; then
+        warn "Порт ${REALITY_PORT} уже выдавался ранее — убедитесь, что в профиле нет дубля."
+    fi
+    owner="$(port_owner "$REALITY_PORT")"
+    if [[ "$REALITY_PORT" != "$rnd" && -n "$owner" ]]; then
+        warn "Порт ${REALITY_PORT} сейчас занят: ${owner}"
+        warn "Если это Xray ноды со старым профилем — порт освободится после смены профиля."
+        confirm "Использовать всё равно?" n || return 1
+    fi
+}
+
+generate_selfsteal_config() {
+    load_state
+    if [[ -z "$DOMAIN" || "$SITE_MODE" != "selfsteal" || -z "$SELFSTEAL_PORT" ]]; then
+        err "Сайт в режиме Selfsteal не установлен — сначала выполните установку (пункт 1 этого меню)"
+        return 1
+    fi
+    choose_reality_port || return 1
+
+    if ! gen_reality_keys; then
+        warn "Не удалось сгенерировать ключи автоматически."
+        warn "Сгенерируйте их в панели (Config Profiles → кнопка генерации ключей) и вставьте privateKey."
+        REALITY_PRIV="ВСТАВЬТЕ_PRIVATE_KEY"
+        REALITY_PUB="-"
+    fi
+
+    local sid tag inbound base
+    sid="$(gen_short_id)"
+    tag="VLESS_REALITY_SELFSTEAL_${REALITY_PORT}"
+    inbound="$(make_inbound_json "$tag" "$REALITY_PORT" "$REALITY_PRIV" "$sid" "$DOMAIN" "127.0.0.1:${SELFSTEAL_PORT}")"
+
+    mkdir -p "$SELFSTEAL_CFG_DIR"
+    chmod 700 "$SELFSTEAL_CFG_DIR"
+    base="${SELFSTEAL_CFG_DIR}/${REALITY_PORT}"
+    printf '%s\n' "$inbound" >"${base}-inbound.json"
+    make_profile_json "$inbound" >"${base}-profile.json"
+    cat >"${base}-host.txt" <<EOF
+Создан:        $(date '+%Y-%m-%d %H:%M')
+Inbound tag:   ${tag}
+Address:       ${DOMAIN}
+Port:          ${REALITY_PORT}
+SNI:           ${DOMAIN}
+Fingerprint:   chrome
+Public key:    ${REALITY_PUB}
+Short ID:      ${sid}
+Reality target: 127.0.0.1:${SELFSTEAL_PORT}
+EOF
+    chmod 600 "${base}"-*
+
+    if [[ " ${REALITY_PORTS} " != *" ${REALITY_PORT} "* ]]; then
+        REALITY_PORTS="${REALITY_PORTS:+$REALITY_PORTS }${REALITY_PORT}"
+    fi
+    save_state
+
+    if ufw_active; then
+        ufw allow "${REALITY_PORT}/tcp" >/dev/null && ok "UFW: открыт порт ${REALITY_PORT}/tcp"
+    fi
+
+    line
+    echo -e "${BOLD}1. Config Profile для панели${NC} (Config Profiles → создать → вставить):"
+    line
+    cat "${base}-profile.json"
+    line
+    echo -e "${DIM}Только inbound (чтобы добавить в существующий профиль): ${base}-inbound.json${NC}"
+    echo
+    echo -e "${BOLD}2. Nodes${NC} → нода → выбрать профиль и отметить inbound ${CYAN}${tag}${NC}"
+    echo -e "${BOLD}3. Hosts${NC} → создать хост:"
+    echo -e "     Inbound:     ${tag}"
+    echo -e "     Address:     ${DOMAIN}"
+    echo -e "     Port:        ${GREEN}${REALITY_PORT}${NC}"
+    echo -e "     SNI:         ${DOMAIN}"
+    echo -e "     Fingerprint: chrome"
+    echo -e "${BOLD}4. Internal Squads${NC} → добавить inbound в сквад пользователей"
+    line
+    echo -e "  Сохранено: ${base}-profile.json / -inbound.json / -host.txt"
+    if [[ "$REALITY_PORT" != "443" ]]; then
+        echo -e "  ${DIM}Порт не 443: откройте его и в фаерволе хостера, если он есть.${NC}"
+    fi
+    line
+}
+
+show_selfsteal_configs() {
+    local f found=0
+    for f in "$SELFSTEAL_CFG_DIR"/*-host.txt; do
+        [[ -f "$f" ]] || continue
+        found=1
+        line
+        cat "$f"
+        echo -e "${DIM}Профиль: ${f%-host.txt}-profile.json${NC}"
+    done
+    if (( found == 0 )); then
+        info "Сохранённых конфигов пока нет"
+    else
+        line
+    fi
+}
+
+flow_selfsteal() {
+    load_state
+    if [[ "$SITE_MODE" == "selfsteal" && -n "$DOMAIN" ]]; then
+        warn "Selfsteal уже установлен для ${DOMAIN} (nginx на 127.0.0.1:${SELFSTEAL_PORT})."
+        warn "Переустановка сменит локальный порт — старые профили перестанут работать."
+        info "Чтобы просто получить новый порт для Hosts, используйте «Новый конфиг для Hosts»."
+        confirm "Всё равно переустановить?" n || return 0
+    fi
+    ensure_base_packages || return 1
+    install_docker       || return 1
+    SITE_MODE_PRESET="selfsteal"
+    install_site
+    local rc=$?
+    SITE_MODE_PRESET=""
+    (( rc == 0 )) || return 1
+    generate_selfsteal_config || return 1
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        warn "Нода на этом сервере ещё не установлена — поставьте её через пункт 1 главного меню."
+    fi
+}
+
+selfsteal_menu() {
+    load_state
+    echo
+    if [[ "$SITE_MODE" == "selfsteal" && -n "$DOMAIN" ]]; then
+        echo -e "  Сейчас: ${GREEN}${DOMAIN}${NC} → 127.0.0.1:${SELFSTEAL_PORT}, выдано портов: ${REALITY_PORTS:-нет}"
+    fi
+    echo "  1) Установить Selfsteal (сайт-заглушка + конфиг для панели)"
+    echo "  2) Новый конфиг для Hosts (новый случайный порт и ключи)"
+    echo "  3) Показать сохранённые конфиги"
+    echo "  0) Назад"
+    local c; ask c "Выбор" "1"
+    case "$c" in
+        1) flow_selfsteal ;;
+        2) generate_selfsteal_config ;;
+        3) show_selfsteal_configs ;;
+    esac
 }
 
 # ============================ СЦЕНАРИИ ================================
@@ -1297,6 +1569,10 @@ uninstall_menu() {
             if confirm "Удалить также сертификат Let's Encrypt?" n; then
                 certbot delete --cert-name "$DOMAIN" --non-interactive
             fi
+            if [[ -d "$SELFSTEAL_CFG_DIR" ]] && confirm "Удалить сохранённые Selfsteal-конфиги (${SELFSTEAL_CFG_DIR})?" y; then
+                rm -rf "${SELFSTEAL_CFG_DIR:?}"
+                REALITY_PORTS=""
+            fi
             DOMAIN=""; SITE_MODE=""; SELFSTEAL_PORT=""; SITE_SOURCE=""
             save_state
             ok "Сайт удалён"
@@ -1354,6 +1630,9 @@ status_line() {
     load_state
     if [[ -n "$DOMAIN" ]]; then site_st="${GREEN}${DOMAIN}${NC} (${SITE_MODE})"; else site_st="${DIM}нет${NC}"; fi
     echo -e "  Нода: ${node_st}    Сайт: ${site_st}"
+    if [[ -n "$REALITY_PORTS" ]]; then
+        echo -e "  Selfsteal порты Hosts: ${GREEN}${REALITY_PORTS}${NC}"
+    fi
     if [[ -f "$COMPOSE_FILE" ]]; then
         if custom_core_active; then
             core_st="${GREEN}$(host_xray_version)${NC} (своё)"
@@ -1380,15 +1659,16 @@ show_menu() {
     line
     echo "  1) Установить ноду Remnawave"
     echo "  2) Установить ноду + сайт-заглушку (nginx + SSL)"
+    echo "  3) Selfsteal Reality (сайт + конфиг для панели, случайные порты)"
     line
-    echo "  3) Установить только сайт-заглушку"
-    echo "  4) Обновить / сменить сайт-заглушку"
-    echo "  5) Логи ноды"
-    echo "  6) Обновить ноду"
-    echo "  7) Ядро Xray (обновить / вернуть встроенное)"
-    echo "  8) Сертификаты для gRPC (проброс в ноду)"
-    echo "  9) Установить rkn-guard"
-    echo " 10) Удаление"
+    echo "  4) Установить только сайт-заглушку"
+    echo "  5) Обновить / сменить сайт-заглушку"
+    echo "  6) Логи ноды"
+    echo "  7) Обновить ноду"
+    echo "  8) Ядро Xray (обновить / вернуть встроенное)"
+    echo "  9) Сертификаты для gRPC (проброс в ноду)"
+    echo " 10) Установить rkn-guard"
+    echo " 11) Удаление"
     echo "  0) Выход"
     line
 }
@@ -1403,14 +1683,15 @@ main() {
         case "$choice" in
             1) flow_node;          pause ;;
             2) flow_node_and_site; pause ;;
-            3) flow_site_only;     pause ;;
-            4) update_site_files;  pause ;;
-            5) show_logs;          pause ;;
-            6) update_node;        pause ;;
-            7) core_menu;          pause ;;
-            8) certs_menu;         pause ;;
-            9) run_rkn_guard;      pause ;;
-            10) uninstall_menu;    pause ;;
+            3) selfsteal_menu;     pause ;;
+            4) flow_site_only;     pause ;;
+            5) update_site_files;  pause ;;
+            6) show_logs;          pause ;;
+            7) update_node;        pause ;;
+            8) core_menu;          pause ;;
+            9) certs_menu;         pause ;;
+            10) run_rkn_guard;     pause ;;
+            11) uninstall_menu;    pause ;;
             0) echo "Пока!"; exit 0 ;;
             *) warn "Нет такого пункта"; sleep 1 ;;
         esac
