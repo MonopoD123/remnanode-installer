@@ -81,6 +81,7 @@ REALITY_PORT=""
 REALITY_PRIV=""
 REALITY_PUB=""
 SITE_PUBLIC443=""     # 1 — nginx в режиме selfsteal дополнительно отдаёт сайт на публичном 443
+BLOCK_RU=""           # 1 — блокировать российские сайты через ноду (по умолчанию)
 
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
@@ -430,6 +431,7 @@ GRPC_DOMAIN="${GRPC_DOMAIN}"
 SITE_SOURCE="${SITE_SOURCE}"
 REALITY_PORTS="${REALITY_PORTS}"
 SITE_PUBLIC443="${SITE_PUBLIC443}"
+BLOCK_RU="${BLOCK_RU}"
 EOF
     chmod 600 "$STATE_FILE"
 }
@@ -1144,6 +1146,216 @@ certs_menu() {
     esac
 }
 
+# ===================== ЗАЩИТА ПОРТА НОДЫ ==============================
+# API ноды (NODE_PORT) должен быть доступен только панели: открытый порт
+# позволяет сканерам определить, что это нода Remnawave.
+# Отдельная цепочка iptables касается ТОЛЬКО этого порта — SSH, сайт и
+# порты Reality не затрагиваются. Правила восстанавливаются после
+# перезагрузки systemd-сервисом.
+GUARD_SCRIPT="/usr/local/sbin/remnanode-guard.sh"
+GUARD_UNIT="/etc/systemd/system/remnanode-guard.service"
+GUARD_CONF="/etc/remnanode-guard.conf"
+
+guard_active() {
+    iptables -S INPUT 2>/dev/null | grep -q -- '-j RW_NODE_GUARD'
+}
+
+# IP, с которых сейчас подключена панель к порту ноды
+panel_peers() {
+    local p="${1:-$NODE_PORT}"
+    [[ -z "$p" ]] && return 0
+    ss -tnH state established "( sport = :${p} )" 2>/dev/null \
+        | awk '{print $NF}' | sed -E 's/^\[?([^]]*)\]?:[0-9]+$/\1/; s/^::ffff://' | sort -u | tr '\n' ' '
+}
+
+valid_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] && return 0
+    [[ "$1" =~ ^[0-9a-fA-F:]+:[0-9a-fA-F:]*(/[0-9]{1,3})?$ ]] && return 0
+    return 1
+}
+
+write_guard_files() {
+    cat >"$GUARD_SCRIPT" <<'EOF'
+#!/bin/sh
+# remnanode-installer: порт ноды открыт только для IP панели
+CONF=/etc/remnanode-guard.conf
+[ -f "$CONF" ] || exit 0
+. "$CONF"
+
+unhook() {   # убрать переходы в цепочку для порта $2
+    while $1 -D INPUT -p tcp --dport "$2" -j RW_NODE_GUARD 2>/dev/null; do :; done
+}
+
+apply() {
+    ipt="$1"
+    command -v "$ipt" >/dev/null 2>&1 || return 0
+    $ipt -N RW_NODE_GUARD 2>/dev/null || true
+    $ipt -F RW_NODE_GUARD
+    $ipt -A RW_NODE_GUARD -i lo -j ACCEPT
+    for ip in $PANEL_IPS; do
+        case "$ipt:$ip" in
+            iptables:*:*) continue ;;    # IPv6-адрес — не для iptables
+            ip6tables:*.*) continue ;;   # IPv4-адрес — не для ip6tables
+        esac
+        $ipt -A RW_NODE_GUARD -s "$ip" -j ACCEPT
+    done
+    $ipt -A RW_NODE_GUARD -j DROP
+    unhook "$ipt" "$NODE_PORT"
+    $ipt -I INPUT 1 -p tcp --dport "$NODE_PORT" -j RW_NODE_GUARD
+}
+
+remove() {
+    ipt="$1"
+    command -v "$ipt" >/dev/null 2>&1 || return 0
+    unhook "$ipt" "$NODE_PORT"
+    $ipt -F RW_NODE_GUARD 2>/dev/null
+    $ipt -X RW_NODE_GUARD 2>/dev/null
+    return 0
+}
+
+case "$1" in
+    stop) remove iptables; remove ip6tables ;;
+    *)    apply iptables;  apply ip6tables ;;
+esac
+exit 0
+EOF
+    chmod 755 "$GUARD_SCRIPT"
+
+    cat >"$GUARD_UNIT" <<EOF
+[Unit]
+Description=Remnawave node port guard (NODE_PORT only for panel IP)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${GUARD_SCRIPT}
+ExecStop=${GUARD_SCRIPT} stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+protect_node_port() {
+    NODE_PORT="${NODE_PORT:-$(get_node_port)}"
+    if [[ -z "$NODE_PORT" ]]; then
+        err "Не найден NODE_PORT — сначала установите ноду"
+        return 1
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        info "Ставлю iptables..."
+        apt_install iptables || { err "Не удалось установить iptables"; return 1; }
+    fi
+
+    local peers ips ip bad=0 old_ips=""
+    [[ -f "$GUARD_CONF" ]] && old_ips="$(. "$GUARD_CONF"; echo "$PANEL_IPS")"
+    peers="$(panel_peers "$NODE_PORT")"
+    peers="${peers% }"
+    echo -e "  Порт ноды: ${BOLD}${NODE_PORT}${NC}"
+    if [[ -n "$peers" ]]; then
+        ok "Сейчас к ноде подключена панель с IP: ${GREEN}${peers}${NC}"
+    else
+        warn "Подключения панели к порту ${NODE_PORT} сейчас нет — введите IP панели вручную."
+    fi
+    if [[ -n "${1:-}" ]]; then
+        ips="$1"
+    else
+        ask ips "IP панели (несколько — через пробел)" "${peers:-$old_ips}"
+    fi
+    ips="${ips//,/ }"
+    if [[ -z "${ips// /}" ]]; then err "IP не указан — порт не закрыт"; return 1; fi
+    for ip in $ips; do
+        valid_ip "$ip" || { err "Некорректный IP: ${ip}"; bad=1; }
+    done
+    (( bad )) && return 1
+
+    # Снять старые правила (порт мог смениться), затем записать новые
+    [[ -x "$GUARD_SCRIPT" ]] && "$GUARD_SCRIPT" stop
+    printf 'NODE_PORT="%s"\nPANEL_IPS="%s"\n' "$NODE_PORT" "$(echo $ips)" >"$GUARD_CONF"
+    chmod 600 "$GUARD_CONF"
+    write_guard_files
+    systemctl daemon-reload
+    systemctl enable remnanode-guard.service >/dev/null 2>&1
+    if ! systemctl restart remnanode-guard.service; then
+        "$GUARD_SCRIPT" || { err "Не удалось применить правила iptables"; return 1; }
+    fi
+
+    if guard_active; then
+        ok "Порт ${NODE_PORT} закрыт для всех, кроме: $(echo $ips)"
+        info "SSH, сайт и порты Reality не затронуты. Правила восстановятся после перезагрузки."
+        sleep 3
+        peers="$(panel_peers "$NODE_PORT")"
+        if [[ -n "$peers" ]]; then ok "Панель по-прежнему подключена: ${peers}"
+        else warn "Проверьте в панели, что нода online. Если нет — неверный IP: пункт «Открыть порт снова»."; fi
+    else
+        err "Правила не применились — проверьте: iptables -S INPUT"
+        return 1
+    fi
+}
+
+unprotect_node_port() {
+    if [[ ! -f "$GUARD_CONF" ]] && ! guard_active; then
+        info "Защита порта ноды не настроена"
+        return 0
+    fi
+    confirm "Снять ограничение — порт ноды снова будет доступен всем?" n || return 0
+    systemctl disable --now remnanode-guard.service >/dev/null 2>&1
+    [[ -x "$GUARD_SCRIPT" ]] && "$GUARD_SCRIPT" stop
+    rm -f "$GUARD_UNIT" "$GUARD_CONF"
+    systemctl daemon-reload
+    ok "Ограничение снято — порт ноды открыт для всех"
+}
+
+# После запуска ноды ждём, пока панель к ней подключится, и сразу закрываем порт
+auto_protect_node_port() {
+    NODE_PORT="${NODE_PORT:-$(get_node_port)}"
+    [[ -z "$NODE_PORT" ]] && return 0
+    local i peers=""
+    info "Жду подключения панели к порту ${NODE_PORT}, чтобы закрыть его для остальных..."
+    echo -e "  ${DIM}(если нода ещё не добавлена в панели — нажмите там «Next» / «Create»)${NC}"
+    for ((i = 0; i < 45; i++)); do
+        peers="$(panel_peers "$NODE_PORT")"; peers="${peers% }"
+        [[ -n "$peers" ]] && break
+        sleep 2
+    done
+    if [[ -n "$peers" ]]; then
+        protect_node_port "$peers"
+    else
+        warn "Панель пока не подключилась — порт ${NODE_PORT} открыт для всех."
+        warn "Когда нода станет online в панели: главное меню → «Закрыть порт ноды»."
+    fi
+}
+
+guard_status() {
+    local np; np="${NODE_PORT:-$(get_node_port)}"
+    if guard_active && [[ -f "$GUARD_CONF" ]]; then
+        ok "Порт ${np} открыт только для: $(. "$GUARD_CONF"; echo "$PANEL_IPS")"
+        echo -e "${DIM}$(iptables -S RW_NODE_GUARD 2>/dev/null | sed 's/^/     /')${NC}"
+    else
+        warn "Порт ноды ${np:-?} открыт для всех"
+    fi
+    local peers; peers="$(panel_peers "$np")"
+    [[ -n "$peers" ]] && info "Активные подключения к ноде: ${peers}"
+}
+
+guard_menu() {
+    local c def="1"
+    guard_active && def="3"
+    MENU_DEFAULT="$def" menu_select c inline "Порт ноды" \
+        "1|Закрыть порт для всех, кроме панели|IP панели определяется по текущему подключению к ноде" \
+        "2|Открыть порт снова|Снять ограничение (например, если сменился IP панели)" \
+        "3|Показать состояние|Какие IP разрешены, кто сейчас подключён" \
+        "0|Назад|"
+    case "$c" in
+        1) protect_node_port ;;
+        2) unprotect_node_port ;;
+        3) guard_status ;;
+        *) return 2 ;;
+    esac
+}
+
 # ============================ САЙТ ====================================
 # Локальный порт nginx для Reality target: по умолчанию — случайный
 ask_selfsteal_port() {
@@ -1161,6 +1373,10 @@ ask_site_params() {
     if ! valid_domain "$DOMAIN"; then
         err "Некорректный домен: '$DOMAIN'"
         return 1
+    fi
+    if suspicious_domain_warn "$DOMAIN" | grep -q .; then
+        suspicious_domain_warn "$DOMAIN"
+        confirm "Продолжить с этим доменом?" y || return 1
     fi
     ask_email
 
@@ -1539,14 +1755,26 @@ gen_short_id() {
 
 # make_inbound_json TAG PORT PRIVKEY SHORTID SNI TARGET
 make_inbound_json() {
+    # settings.flow — Remnawave берёт flow для пользователей именно отсюда;
+    # без него в подписке нет flow=xtls-rprx-vision (виден «TLS внутри TLS»).
+    # sniffing.routeOnly — домен из SNI/HTTP используется только для маршрутизации,
+    # адрес назначения не подменяется (меньше сбоев и странного поведения)
     cat <<EOF
 {
   "tag": "$1",
   "port": $2,
   "listen": "0.0.0.0",
   "protocol": "vless",
-  "settings": { "clients": [], "decryption": "none" },
-  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "settings": {
+    "clients": [],
+    "decryption": "none",
+    "flow": "xtls-rprx-vision"
+  },
+  "sniffing": {
+    "enabled": true,
+    "routeOnly": true,
+    "destOverride": ["http", "tls", "quic"]
+  },
   "streamSettings": {
     "network": "tcp",
     "security": "reality",
@@ -1564,28 +1792,112 @@ make_inbound_json() {
 EOF
 }
 
-# make_profile_json "<inbound json>"
+# make_profile_json "<inbound json>" [блокировать_ru 1|0]
+#   log.access none      — журнал подключений не пишется
+#   dns DoH              — сервер резолвит домены не через DNS хостера
+#   UseIPv4              — без внезапных выходов по IPv6
+#   geoip:private        — нет доступа к внутренней сети сервера через туннель
+#   bittorrent           — нет жалоб правообладателей хостеру
+#   geoip/geosite ru     — российские сервисы не видят IP ноды (по желанию)
 make_profile_json() {
-    local inb
+    local inb ru_rules=""
     inb="$(sed 's/^/    /' <<<"$1")"
+    if [[ "${2:-1}" == "1" ]]; then
+        ru_rules=$',\n      { "domain": ["geosite:category-ru"], "outboundTag": "BLOCK" },\n      { "ip": ["geoip:ru"], "outboundTag": "BLOCK" }'
+    fi
     cat <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": {
+    "loglevel": "warning",
+    "access": "none"
+  },
+  "dns": {
+    "servers": [
+      "https+local://1.1.1.1/dns-query",
+      "https+local://8.8.8.8/dns-query"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
   "inbounds": [
 ${inb}
   ],
   "outbounds": [
-    { "tag": "DIRECT", "protocol": "freedom" },
-    { "tag": "BLOCK", "protocol": "blackhole" }
+    {
+      "tag": "DIRECT",
+      "protocol": "freedom",
+      "streamSettings": { "sockopt": { "domainStrategy": "UseIPv4" } }
+    },
+    {
+      "tag": "BLOCK",
+      "protocol": "blackhole"
+    }
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       { "ip": ["geoip:private"], "outboundTag": "BLOCK" },
-      { "protocol": ["bittorrent"], "outboundTag": "BLOCK" }
+      { "protocol": ["bittorrent"], "outboundTag": "BLOCK" }${ru_rules}
     ]
   }
 }
 EOF
+}
+
+# validate_profile ФАЙЛ — проверка профиля ядром Xray самой ноды (с её geo-файлами).
+#   0 — профиль валиден, 1 — ошибка (текст в VALIDATE_OUT), 2 — проверить нечем (нода не запущена)
+VALIDATE_OUT=""
+validate_profile() {
+    VALIDATE_OUT=""
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode || return 2
+    local tmp="/tmp/rw-profile-check-$$.json"
+    docker exec -i remnanode sh -c "cat > ${tmp}" <"$1" 2>/dev/null || return 2
+    if VALIDATE_OUT="$(docker exec remnanode xray run -test -c "$tmp" 2>&1)"; then
+        docker exec remnanode rm -f "$tmp" >/dev/null 2>&1
+        return 0
+    fi
+    docker exec remnanode rm -f "$tmp" >/dev/null 2>&1
+    return 1
+}
+
+# check_and_fix_profile PORT — проверяет сохранённый профиль; если в geo-файлах
+# ноды нет нужных категорий, пересобирает профиль без RU-правил.
+check_and_fix_profile() {
+    local base="${SELFSTEAL_CFG_DIR}/$1" rc
+    [[ -f "${base}-profile.json" ]] || return 0
+    validate_profile "${base}-profile.json"; rc=$?
+    case $rc in
+        0) ok "Профиль проверен ядром Xray ноды — ошибок нет" ;;
+        2) info "Нода не запущена — профиль проверится при применении в панели" ;;
+        1)
+            if grep -qiE 'category-ru|geoip:ru|geosite|geoip' <<<"$VALIDATE_OUT" \
+                    && grep -q 'category-ru' "${base}-profile.json"; then
+                warn "В geo-файлах ноды нет списков для России — убираю RU-правила из профиля."
+                make_profile_json "$(cat "${base}-inbound.json")" 0 >"${base}-profile.json"
+                BLOCK_RU="0"; save_state
+                if validate_profile "${base}-profile.json"; then
+                    ok "Исправленный профиль проверен — ошибок нет"
+                    info "Чтобы вернуть блокировку RU: пункт 8 → обновить ядро и заменить geoip/geosite, затем новый конфиг."
+                    echo; cat "${base}-profile.json"
+                else
+                    err "Xray всё ещё не принимает профиль:"; tail -n 5 <<<"$VALIDATE_OUT" | sed 's/^/     /'
+                fi
+            else
+                err "Xray не принимает профиль:"; tail -n 5 <<<"$VALIDATE_OUT" | sed 's/^/     /'
+            fi
+            ;;
+    esac
+}
+
+# Слова в имени домена, по которым его легко найти в логах Certificate Transparency
+suspicious_domain_warn() {
+    local d="$1" w
+    for w in vpn proxy xray v2ray vless reality tunnel node socks wg wireguard trojan; do
+        if [[ "$d" == *"$w"* ]]; then
+            warn "В домене есть «${w}». Все сертификаты Let's Encrypt публикуются в открытых логах (crt.sh),"
+            warn "и такие имена легко ищутся. Лучше нейтральное: play., radio., cdn., static., media."
+            return 0
+        fi
+    done
 }
 
 # Выбор публичного порта inbound'а (= порт в Hosts). По умолчанию — случайный.
@@ -1653,6 +1965,14 @@ generate_selfsteal_config() {
         REALITY_PUB="-"
     fi
 
+    # Российские сайты через ноду: по умолчанию блокируем, чтобы IP ноды не собирали RU-сервисы
+    local ru
+    echo
+    MENU_DEFAULT="${BLOCK_RU:-1}" menu_select ru inline "Российские сайты через ноду" \
+        "1|Блокировать (рекомендуется)|RU-сервисы не увидят IP ноды; в клиенте пустите .ru напрямую (маршрутизация «Россия — direct»)" \
+        "0|Пропускать|Всё идёт через ноду, но IP сервера могут занести в списки"
+    [[ "$ru" == "1" ]] && BLOCK_RU="1" || BLOCK_RU="0"
+
     local sid tag inbound base
     sid="$(gen_short_id)"
     tag="VLESS_REALITY_SELFSTEAL_${REALITY_PORT}"
@@ -1662,7 +1982,11 @@ generate_selfsteal_config() {
     chmod 700 "$SELFSTEAL_CFG_DIR"
     base="${SELFSTEAL_CFG_DIR}/${REALITY_PORT}"
     printf '%s\n' "$inbound" >"${base}-inbound.json"
-    make_profile_json "$inbound" >"${base}-profile.json"
+    make_profile_json "$inbound" "$BLOCK_RU" >"${base}-profile.json"
+    if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${base}-profile.json" 2>/dev/null; then
+        err "Сгенерированный профиль — невалидный JSON (${base}-profile.json). Сообщите об ошибке."
+        return 1
+    fi
     cat >"${base}-host.txt" <<EOF
 Создан:        $(date '+%Y-%m-%d %H:%M')
 Inbound tag:   ${tag}
@@ -1714,6 +2038,33 @@ EOF
     if [[ "$REALITY_PORT" != "443" ]]; then
         echo -e "  ${DIM}Порт ${REALITY_PORT} не 443: откройте его и в фаерволе хостера, если он есть.${NC}"
     fi
+    line
+    security_notes
+    check_and_fix_profile "$REALITY_PORT"
+}
+
+# Памятка: что ещё может выдать ноду, кроме самого конфига
+security_notes() {
+    local np; np="${NODE_PORT:-$(get_node_port)}"
+    echo -e "${BOLD}Безопасность — проверьте:${NC}"
+    if [[ "$REALITY_PORT" == "443" ]]; then
+        echo -e "  ${GREEN}✓${NC} Reality на 443 — трафик выглядит как обычный HTTPS"
+    else
+        echo -e "  ${YELLOW}!${NC} Порт ${REALITY_PORT}: долгий TLS на высокий порт заметнее для DPI."
+        echo -e "    ${DIM}Для основного хоста лучше 443, случайные порты — для запасных.${NC}"
+    fi
+    echo -e "  ${YELLOW}!${NC} В ссылке подписки должен быть ${BOLD}flow=xtls-rprx-vision${NC} (без Vision виден «TLS внутри TLS»)"
+    if guard_active; then
+        echo -e "  ${GREEN}✓${NC} Порт ноды ${np} открыт только для панели"
+    else
+        echo -e "  ${YELLOW}!${NC} Порт ноды ${np:-NODE_PORT} открыт для всех — закроется сам после подключения панели"
+        echo -e "    ${DIM}или вручную: главное меню → «Закрыть порт ноды»${NC}"
+    fi
+    local ru_hint=""; [[ "$BLOCK_RU" == "1" ]] && ru_hint=" и правило «Россия — напрямую»"
+    echo -e "  ${YELLOW}!${NC} В клиенте включите DNS через туннель / DoH${ru_hint}"
+    [[ "$BLOCK_RU" != "1" ]] && echo -e "  ${DIM}  (RU-сайты идут через ноду — её IP могут собирать российские сервисы)${NC}"
+    echo -e "  ${YELLOW}!${NC} Не публикуйте privateKey: при утечке — «Новый конфиг для Hosts»"
+    suspicious_domain_warn "$DOMAIN"
     line
 }
 
@@ -1835,7 +2186,9 @@ flow_selfsteal() {
 
     echo; echo -e "${step}Шаг 5/5 · Запуск ноды${NC}"
     start_node || { stopped 5; return 1; }
+    auto_protect_node_port
     echo
+    check_and_fix_profile "$REALITY_PORT"
     check_selfsteal_site
     node_finish_hint
 }
@@ -1874,6 +2227,7 @@ flow_node() {
     install_docker       || return 1
     configure_node       || return 1
     start_node           || return 1
+    auto_protect_node_port
     node_finish_hint
     echo -e "  ${DIM}Сертификаты для gRPC — пункт 9, сайт-заглушка — пункты 3/4.${NC}"
 }
@@ -1888,6 +2242,7 @@ flow_node_and_site() {
     fi
     setup_grpc_certs "${DOMAIN:-$GRPC_DOMAIN}" 1
     start_node           || return 1
+    auto_protect_node_port
     node_finish_hint
 }
 
@@ -1927,6 +2282,11 @@ uninstall_menu() {
             confirm "Точно удалить ноду (контейнер и ${NODE_DIR})?" n || return 0
             if [[ -f "$COMPOSE_FILE" ]]; then (cd "$NODE_DIR" && docker compose down); fi
             rm -rf "$NODE_DIR"
+            if [[ -f "$GUARD_CONF" ]]; then
+                systemctl disable --now remnanode-guard.service >/dev/null 2>&1
+                [[ -x "$GUARD_SCRIPT" ]] && "$GUARD_SCRIPT" stop
+                rm -f "$GUARD_UNIT" "$GUARD_CONF"; systemctl daemon-reload
+            fi
             rm -f "$RENEW_HOOK"
             GRPC_DOMAIN=""
             save_state
@@ -2046,6 +2406,11 @@ status_block() {
         else
             dot "$DIM"   "Ядро Xray " "${DIM}встроенное в образ${NC}"
         fi
+        if guard_active; then
+            dot "$GREEN"  "Порт ноды " "${GREEN}только для панели${NC}"
+        else
+            dot "$YELLOW" "Порт ноды " "${YELLOW}открыт для всех${NC} ${DIM}→ пункт 10${NC}"
+        fi
         if certs_mounted; then
             dot "$GREEN" "gRPC/TLS  " "${GRPC_DOMAIN:-сертификаты проброшены}"
         else
@@ -2154,9 +2519,10 @@ main() {
             "7|🔄 Обновить ноду|Скачать свежий образ remnawave/node и перезапустить" \
             "8|🧬 Ядро Xray|Поставить нужную версию Xray-core или вернуть встроенную" \
             "9|🔐 Сертификаты gRPC|Пробросить сертификаты Let's Encrypt в контейнер ноды" \
-            "10|🚧 rkn-guard|Запустить сторонний установщик Flecksis/rkn-guard" \
+            "10|🔒 Закрыть порт ноды|API ноды доступен только IP панели — сканеры не увидят Remnawave" \
+            "11|🚧 rkn-guard|Запустить сторонний установщик Flecksis/rkn-guard" \
             "---" \
-            "11|❌ Удаление|Удалить ноду или сайт-заглушку" \
+            "12|❌ Удаление|Удалить ноду или сайт-заглушку" \
             "0|🚪 Выход|"
         [[ "$choice" == "0" ]] && { printf '\e[H\e[2J'; echo -e "  ${CYAN}Пока!${NC}"; exit 0; }
         last="$choice"
@@ -2172,8 +2538,9 @@ main() {
             7)  update_node ;;
             8)  core_menu ;;
             9)  certs_menu ;;
-            10) run_rkn_guard ;;
-            11) uninstall_menu ;;
+            10) guard_menu ;;
+            11) run_rkn_guard ;;
+            12) uninstall_menu ;;
         esac
         rc=$?
         (( rc == 2 )) || pause      # 2 = «Назад» из подменю — сразу в главное меню
