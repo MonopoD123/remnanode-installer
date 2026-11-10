@@ -79,6 +79,7 @@ REALITY_PUB=""
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
 BOLD=$'\e[1m'; DIM=$'\e[2m'; NC=$'\e[0m'
+MAGENTA=$'\e[35m'; SEL=$'\e[1;97;44m'   # подсветка выбранного пункта: белый на синем
 
 info() { echo -e "${CYAN}[i]${NC} $*"; }
 ok()   { echo -e "${GREEN}[✓]${NC} $*"; }
@@ -94,7 +95,10 @@ if [[ ! -r /dev/tty ]]; then
 fi
 
 ORIG_STTY="$(stty -g </dev/tty 2>/dev/null)"
-restore_tty() { [[ -n "$ORIG_STTY" ]] && stty "$ORIG_STTY" </dev/tty 2>/dev/null; }
+restore_tty() {
+    printf '\e[?25h' >/dev/tty 2>/dev/null   # вернуть курсор
+    [[ -n "$ORIG_STTY" ]] && stty "$ORIG_STTY" </dev/tty 2>/dev/null
+}
 trap restore_tty EXIT
 
 # ask VAR "Вопрос" [значение_по_умолчанию]
@@ -140,7 +144,149 @@ read_multiline() {
     printf -v "$1" '%s' "$__out"
 }
 
-pause() { echo; read -r -p "Нажмите Enter, чтобы вернуться в меню..." _ </dev/tty; }
+pause() {
+    echo
+    echo -ne "  ${DIM}Нажмите любую клавишу, чтобы вернуться в меню...${NC}"
+    read -rsn1 _ </dev/tty
+    echo
+}
+
+# ----------------------- Интерактивное меню ---------------------------
+# menu_select VAR РЕЖИМ ЗАГОЛОВОК "ключ|подпись|подсказка" ...
+#   РЕЖИМ full   — меню на весь экран, ЗАГОЛОВОК = имя функции, рисующей шапку
+#   РЕЖИМ inline — меню на месте (внутри сценариев), ЗАГОЛОВОК = текст вопроса
+#   Пункт "---|Текст" — разделитель (необязательно с подписью).
+#   Управление: ↑/↓ (или j/k), Enter, цифра/буква — сразу, q или Esc — назад.
+#   В VAR попадает ключ пункта; q/Esc дают "0". Подпись — в MENU_LABEL.
+#   MENU_DEFAULT=ключ — на каком пункте стоит курсор при открытии.
+MENU_LABEL=""
+menu_select() {
+    local __var="$1" __mode="$2" __title="$3"; shift 3
+    local -a mk ml md
+    local spec rest i n sel=-1 key seq k2 buf res="" drawn=0 kk cols desc
+
+    for spec in "$@"; do
+        mk+=("${spec%%|*}")
+        rest="${spec#*|}"
+        [[ "$rest" == "$spec" ]] && rest=""
+        if [[ "$rest" == *"|"* ]]; then ml+=("${rest%%|*}"); md+=("${rest#*|}")
+        else ml+=("$rest"); md+=(""); fi
+    done
+    n=${#mk[@]}
+    for ((i = 0; i < n; i++)); do
+        [[ "${mk[$i]}" == "---" ]] && continue
+        (( sel < 0 )) && sel=$i
+        if [[ -n "${MENU_DEFAULT:-}" && "${mk[$i]}" == "$MENU_DEFAULT" ]]; then sel=$i; break; fi
+    done
+    (( sel < 0 )) && return 1
+
+    # Перемещение курсора с пропуском разделителей и переходом по кругу
+    _menu_step() {
+        local s=$1 j
+        for ((j = 0; j < n; j++)); do
+            sel=$(( (sel + s + n) % n ))
+            [[ "${mk[$sel]}" != "---" ]] && return
+        done
+    }
+
+    cols="$(tput cols 2>/dev/null || echo 80)"
+    printf '\e[?25l' >/dev/tty
+    [[ "$__mode" == "inline" ]] && echo -e "${BOLD}${CYAN}?${NC} ${BOLD}${__title}${NC}"
+
+    while true; do
+        if [[ "$__mode" == "full" ]]; then
+            printf '\e[H\e[2J'
+            "$__title"
+        elif (( drawn > 0 )); then
+            printf '\e[%dA\e[J' "$drawn"
+        fi
+        drawn=0
+        for ((i = 0; i < n; i++)); do
+            if [[ "${mk[$i]}" == "---" ]]; then
+                if [[ -n "${ml[$i]}" ]]; then
+                    echo -e "   ${MAGENTA}${BOLD}${ml[$i]}${NC}"
+                else
+                    echo -e "   ${DIM}──────────────────────────────${NC}"
+                fi
+            else
+                printf -v kk '%2s' "${mk[$i]}"
+                if (( i == sel )); then
+                    echo -e "  ${CYAN}${BOLD}❯${NC} ${SEL} ${kk}  ${ml[$i]} ${NC}"
+                else
+                    echo -e "    ${DIM}${kk}${NC}  ${ml[$i]}"
+                fi
+            fi
+            drawn=$((drawn + 1))
+        done
+        desc="${md[$sel]}"
+        (( ${#desc} > cols - 8 )) && desc="${desc:0:$((cols - 9))}…"
+        echo
+        if [[ -n "$desc" ]]; then echo -e "   ${YELLOW}↳${NC} ${DIM}${desc}${NC}"; else echo; fi
+        echo -e "   ${DIM}↑↓ выбор · Enter — ок · цифра — сразу · q/Esc — назад${NC}"
+        drawn=$((drawn + 3))
+
+        key=""; IFS= read -rsn1 key </dev/tty
+        case "$key" in
+            $'\e')
+                seq=""; IFS= read -rsn2 -t 0.05 seq </dev/tty
+                case "$seq" in
+                    '[A'|'OA') _menu_step -1 ;;
+                    '[B'|'OB') _menu_step 1 ;;
+                    '') res="0"; break ;;          # одиночный Esc — назад
+                esac
+                ;;
+            '') res="${mk[$sel]}"; break ;;        # Enter
+            *)
+                buf="$key"
+                # Двузначные пункты (10, 11): ждём вторую цифру
+                if [[ "$key" =~ ^[0-9]$ ]]; then
+                    for ((i = 0; i < n; i++)); do
+                        if [[ "${mk[$i]}" == "${key}"? ]]; then
+                            k2=""; IFS= read -rsn1 -t 0.6 k2 </dev/tty
+                            [[ "$k2" =~ ^[0-9]$ ]] && buf+="$k2"
+                            break
+                        fi
+                    done
+                fi
+                res=""
+                for ((i = 0; i < n; i++)); do
+                    [[ "${mk[$i]}" != "---" && "${mk[$i]}" == "$buf" ]] && { sel=$i; res="$buf"; break; }
+                done
+                [[ -n "$res" ]] && break
+                case "$key" in
+                    k|K) _menu_step -1 ;;
+                    j|J) _menu_step 1 ;;
+                    q|Q) res="0"; break ;;
+                esac
+                ;;
+        esac
+    done
+    unset -f _menu_step
+    printf '\e[?25h' >/dev/tty
+
+    MENU_LABEL=""
+    for ((i = 0; i < n; i++)); do
+        [[ "${mk[$i]}" == "$res" ]] && MENU_LABEL="${ml[$i]}"
+    done
+    if [[ "$__mode" == "inline" ]]; then
+        # Сворачиваем меню в одну строку с ответом
+        printf '\e[%dA\e[J' "$((drawn + 1))"
+        if [[ "$res" == "0" && -z "$MENU_LABEL" ]]; then
+            echo -e "${BOLD}${CYAN}?${NC} ${BOLD}${__title}${NC} ${DIM}— отмена${NC}"
+        else
+            echo -e "${BOLD}${CYAN}?${NC} ${BOLD}${__title}${NC} ${GREEN}${MENU_LABEL}${NC}"
+        fi
+    fi
+    printf -v "$__var" '%s' "$res"
+}
+
+# Шапка перед запуском выбранного действия
+action_header() {
+    printf '\e[H\e[2J'
+    echo
+    echo -e "  ${CYAN}${BOLD}▶ ${1}${NC}"
+    line
+}
 
 # ------------------------------ Проверки ------------------------------
 check_root() {
@@ -274,11 +420,10 @@ configure_node() {
     echo "  Nodes → Management → «+» → заполните форму (обратите внимание на Node Port)"
     echo "  → нажмите «Copy docker-compose.yml»"
     line
-    echo "Как задать конфигурацию ноды?"
-    echo "  1) Вставить docker-compose.yml, скопированный из панели (рекомендуется)"
-    echo "  2) Ввести NODE_PORT и SECRET_KEY вручную"
     local method
-    ask method "Выбор" "1"
+    menu_select method inline "Как задать конфигурацию ноды?" \
+        "1|Вставить docker-compose.yml из панели|Рекомендуется: скопируйте целиком кнопкой «Copy docker-compose.yml»" \
+        "2|Ввести NODE_PORT и SECRET_KEY вручную|Скрипт сам соберёт docker-compose.yml"
 
     case "$method" in
         1)
@@ -329,7 +474,7 @@ services:
 EOF
             ;;
         *)
-            err "Неверный выбор"
+            info "Отменено"
             return 1
             ;;
     esac
@@ -530,21 +675,25 @@ choose_xray_version() {
             tags+=("$t"); flags+=("$p"); dates+=("$d")
         done <<<"$list"
 
-        echo
-        echo -e "${BOLD}Доступные версии Xray-core:${NC}"
+        local -a items=()
         for i in "${!tags[@]}"; do
             mark=""
             if [[ "${flags[$i]}" == "true" ]]; then
-                mark=" ${YELLOW}(pre-release)${NC}"
+                mark=" ${YELLOW}pre-release${NC}"
             elif (( i == 0 )); then
-                mark=" ${GREEN}(последняя стабильная)${NC}"
+                mark=" ${GREEN}последняя стабильная${NC}"
             fi
-            echo -e "  $((i + 1))) ${tags[$i]}  ${DIM}${dates[$i]}${NC}${mark}"
+            items+=("$((i + 1))|${tags[$i]}${mark}|Опубликована ${dates[$i]}")
         done
-        echo "  m) Ввести версию вручную"
-        if (( pre )); then echo "  s) Показать только стабильные"; else echo "  a) Показать и pre-release"; fi
-        echo "  0) Отмена"
-        ask choice "Выбор" "1"
+        items+=("---" "m|Ввести версию вручную|Например v26.7.28")
+        if (( pre )); then
+            items+=("s|Показать только стабильные|Скрыть pre-release")
+        else
+            items+=("a|Показать и pre-release|Тестовые сборки могут быть нестабильны")
+        fi
+        items+=("0|Отмена|")
+        echo
+        menu_select choice inline "Версия Xray-core" "${items[@]}"
 
         case "${choice,,}" in
             0) return 1 ;;
@@ -689,14 +838,15 @@ restore_bundled_core() {
 
 core_menu() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
-    echo
-    echo "  1) Установить / обновить ядро Xray (выбор версии)"
-    echo "  2) Вернуть встроенное в образ ядро"
-    echo "  0) Назад"
-    local c; ask c "Выбор" "1"
+    local c
+    menu_select c inline "Ядро Xray" \
+        "1|Установить / обновить ядро|Выбор версии из релизов XTLS/Xray-core, проверка SHA-256" \
+        "2|Вернуть встроенное в образ ядро|Убрать своё ядро и пересоздать контейнер" \
+        "0|Назад|"
     case "$c" in
         1) update_core ;;
         2) restore_bundled_core ;;
+        *) return 2 ;;
     esac
 }
 
@@ -886,16 +1036,17 @@ remove_grpc_certs() {
 certs_menu() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
     load_state
-    echo
-    echo "  1) Пробросить сертификаты / сменить домен"
-    echo "  2) Показать пути и пример gRPC inbound"
-    echo "  3) Убрать сертификаты из ноды"
-    echo "  0) Назад"
-    local c; ask c "Выбор" "1"
+    local c
+    menu_select c inline "Сертификаты для gRPC" \
+        "1|Пробросить сертификаты / сменить домен|Монтирует /etc/letsencrypt в контейнер ноды (только чтение)" \
+        "2|Показать пути и пример gRPC inbound|Готовый JSON для Config Profile" \
+        "3|Убрать сертификаты из ноды|Inbound'ы с этими сертификатами перестанут работать" \
+        "0|Назад|"
     case "$c" in
         1) setup_grpc_certs "${GRPC_DOMAIN:-$DOMAIN}" ;;
         2) if [[ -n "$GRPC_DOMAIN" ]]; then grpc_hint; else info "Сертификаты ещё не настроены"; fi ;;
         3) remove_grpc_certs ;;
+        *) return 2 ;;
     esac
 }
 
@@ -964,17 +1115,14 @@ ask_site_params() {
         return 0
     fi
 
-    echo
-    echo "Режим работы сайта:"
-    echo "  1) Selfsteal для Reality — nginx слушает только 127.0.0.1, порт 443 занимает Xray"
-    echo "     (сайт открывается через Xray, домен используется как SNI/serverName)"
-    echo "  2) Обычный сайт — nginx сам слушает публичный 443"
     local m
-    ask m "Выбор" "1"
+    menu_select m inline "Режим работы сайта" \
+        "1|Selfsteal для Reality|nginx только на 127.0.0.1, сайт открывается через Xray, домен = SNI" \
+        "2|Обычный сайт|nginx сам слушает публичный 443"
     case "$m" in
         1) SITE_MODE="selfsteal"; ask_selfsteal_port || return 1 ;;
         2) SITE_MODE="public"; SELFSTEAL_PORT="" ;;
-        *) err "Неверный выбор"; return 1 ;;
+        *) info "Отменено"; return 1 ;;
     esac
 }
 
@@ -1001,14 +1149,14 @@ choose_site_template() {
     for i in "${!SITE_TEMPLATES[@]}"; do
         [[ "${SITE_TEMPLATES[$i]}" == "$SITE_SOURCE" ]] && def=$((i + 1))
     done
-    echo
-    echo "Какой сайт-заглушку поставить?"
+    local -a items=()
     for i in "${!SITE_TEMPLATES[@]}"; do
-        echo -e "  $((i + 1))) ${SITE_TEMPLATE_TITLES[$i]}  ${DIM}(${SITE_TEMPLATES[$i]})${NC}"
+        items+=("$((i + 1))|${SITE_TEMPLATE_TITLES[$i]}|Архив ${SITE_TEMPLATES[$i]} из репозитория ${GITHUB_USER}/${GITHUB_REPO}")
     done
-    echo "  r) Случайный из списка"
-    echo "  u) Свой zip-архив по ссылке"
-    ask c "Выбор" "$def"
+    items+=("---" "r|Случайный из списка|Каждая нода получит свой вид — так их сложнее связать между собой")
+    items+=("u|Свой zip-архив по ссылке|Прямая ссылка https://…/site.zip с index.html внутри")
+    echo
+    MENU_DEFAULT="$def" menu_select c inline "Сайт-заглушка" "${items[@]}"
     case "${c,,}" in
         u)
             ask url "Прямая ссылка на .zip (https://...)"
@@ -1022,7 +1170,7 @@ choose_site_template() {
             if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SITE_TEMPLATES[@]} )); then
                 SITE_SOURCE="${SITE_TEMPLATES[$((c - 1))]}"
             else
-                err "Нет такого пункта"; return 1
+                info "Отменено"; return 1
             fi
             ;;
     esac
@@ -1332,11 +1480,10 @@ choose_reality_port() {
     rnd="$(random_free_port "$REALITY_PORT_MIN" "$REALITY_PORT_MAX")" || {
         err "Не удалось подобрать свободный порт"; return 1; }
     echo
-    echo "Порт inbound'а (его же указываете в Hosts панели):"
-    echo -e "  1) Случайный: ${GREEN}${rnd}${NC}"
-    echo "  2) 443 (стандартный HTTPS)"
-    echo "  3) Указать вручную"
-    ask c "Выбор" "1"
+    menu_select c inline "Порт inbound'а (он же порт в Hosts)" \
+        "1|Случайный: ${GREEN}${rnd}${NC}|Из диапазона ${REALITY_PORT_MIN}–${REALITY_PORT_MAX}, не совпадает с выданными ранее" \
+        "2|443|Стандартный HTTPS — трафик выглядит естественнее" \
+        "3|Указать вручную|"
     case "$c" in
         1) REALITY_PORT="$rnd" ;;
         2) REALITY_PORT="443" ;;
@@ -1344,7 +1491,7 @@ choose_reality_port() {
             ask REALITY_PORT "Порт"
             valid_port "$REALITY_PORT" || { err "Некорректный порт"; return 1; }
             ;;
-        *) err "Неверный выбор"; return 1 ;;
+        *) info "Отменено"; return 1 ;;
     esac
     if [[ " ${REALITY_PORTS} " == *" ${REALITY_PORT} "* ]]; then
         warn "Порт ${REALITY_PORT} уже выдавался ранее — убедитесь, что в профиле нет дубля."
@@ -1466,19 +1613,22 @@ flow_selfsteal() {
 
 selfsteal_menu() {
     load_state
-    echo
+    local c def="1"
     if [[ "$SITE_MODE" == "selfsteal" && -n "$DOMAIN" ]]; then
-        echo -e "  Сейчас: ${GREEN}${DOMAIN}${NC} → 127.0.0.1:${SELFSTEAL_PORT}, выдано портов: ${REALITY_PORTS:-нет}"
+        echo -e "  Сейчас: ${GREEN}${DOMAIN}${NC} → 127.0.0.1:${SELFSTEAL_PORT}, порты Hosts: ${GREEN}${REALITY_PORTS:-нет}${NC}"
+        echo
+        def="2"
     fi
-    echo "  1) Установить Selfsteal (сайт-заглушка + конфиг для панели)"
-    echo "  2) Новый конфиг для Hosts (новый случайный порт и ключи)"
-    echo "  3) Показать сохранённые конфиги"
-    echo "  0) Назад"
-    local c; ask c "Выбор" "1"
+    MENU_DEFAULT="$def" menu_select c inline "Selfsteal Reality" \
+        "1|Установить Selfsteal|Сайт-заглушка на nginx + сертификат + готовый Config Profile" \
+        "2|Новый конфиг для Hosts|Новый случайный порт, ключи x25519 и shortId" \
+        "3|Показать сохранённые конфиги|Все выданные порты и настройки хостов" \
+        "0|Назад|"
     case "$c" in
         1) flow_selfsteal ;;
         2) generate_selfsteal_config ;;
         3) show_selfsteal_configs ;;
+        *) return 2 ;;
     esac
 }
 
@@ -1520,27 +1670,28 @@ update_site_files() {
     load_state
     if [[ -z "$DOMAIN" ]]; then err "Сайт ещё не установлен"; return 1; fi
     resolve_site_url
+    echo -e "  Сейчас установлен: ${GREEN}${SITE_ZIP_NAME}${NC} на ${DOMAIN}"
     echo
-    echo "  Сейчас установлен: ${SITE_ZIP_NAME}"
-    echo "  1) Обновить его из GitHub"
-    echo "  2) Сменить на другой сайт"
-    echo "  0) Назад"
-    local c; ask c "Выбор" "1"
+    local c
+    menu_select c inline "Сайт-заглушка" \
+        "1|Обновить текущий из GitHub|Скачать свежую версию ${SITE_ZIP_NAME}" \
+        "2|Сменить на другой сайт|Выбрать другой шаблон или свой zip" \
+        "0|Назад|"
     case "$c" in
         1) ;;
         2) choose_site_template || return 1 ;;
-        *) return 0 ;;
+        *) return 2 ;;
     esac
     deploy_site_files && save_state && systemctl reload nginx && ok "Сайт ${SITE_ZIP_NAME} развёрнут для ${DOMAIN}"
 }
 
 uninstall_menu() {
     load_state
-    echo
-    echo "  1) Удалить ноду Remnawave"
-    echo "  2) Удалить сайт-заглушку"
-    echo "  0) Назад"
-    local c; ask c "Выбор" "0"
+    local c
+    MENU_DEFAULT="0" menu_select c inline "Что удалить?" \
+        "1|${RED}Ноду Remnawave${NC}|Контейнер и ${NODE_DIR}; при желании — своё ядро Xray" \
+        "2|${RED}Сайт-заглушку${NC}|Конфиг nginx, файлы сайта, по желанию — сертификат и Selfsteal-конфиги" \
+        "0|Назад|"
     case "$c" in
         1)
             confirm "Точно удалить ноду (контейнер и ${NODE_DIR})?" n || return 0
@@ -1578,6 +1729,7 @@ uninstall_menu() {
             save_state
             ok "Сайт удалён"
             ;;
+        *) return 2 ;;
     esac
 }
 
@@ -1619,83 +1771,122 @@ run_rkn_guard() {
 }
 
 # ============================ МЕНЮ ====================================
-status_line() {
-    local node_st site_st core_st cert_st
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
-        node_st="${GREEN}работает${NC}"
-    elif [[ -f "$COMPOSE_FILE" ]]; then
-        node_st="${YELLOW}установлена, но не запущена${NC}"
-    else
-        node_st="${DIM}не установлена${NC}"
-    fi
+SERVER_INFO=""
+STATUS_CACHE=""
+
+# Строка рамки: box_row "видимый текст (ASCII)" "текст с цветами"
+BOX_W=50
+box_row() {
+    local pad=$(( BOX_W - ${#1} ))
+    (( pad < 0 )) && pad=0
+    printf "  ${CYAN}│${NC}%s%*s${CYAN}│${NC}\n" "$2" "$pad" ""
+}
+box_edge() {
+    local l="$1" r="$2" bar
+    printf -v bar '%*s' "$BOX_W" ""
+    echo -e "  ${CYAN}${l}${bar// /─}${r}${NC}"
+}
+
+# dot ЦВЕТ "Метка" "значение" — строка статуса с цветной точкой
+dot() { echo -e "   ${1}●${NC} ${DIM}${2}${NC} ${3}"; }
+
+status_block() {
     load_state
-    if [[ -n "$DOMAIN" ]]; then site_st="${GREEN}${DOMAIN}${NC} (${SITE_MODE})"; else site_st="${DIM}нет${NC}"; fi
-    echo -e "  Нода: ${node_st}    Сайт: ${site_st}"
-    if [[ -n "$REALITY_PORTS" ]]; then
-        echo -e "  Selfsteal порты Hosts: ${GREEN}${REALITY_PORTS}${NC}"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
+        dot "$GREEN"  "Нода      " "${GREEN}работает${NC}"
+    elif [[ -f "$COMPOSE_FILE" ]]; then
+        dot "$YELLOW" "Нода      " "${YELLOW}установлена, но не запущена${NC}"
+    else
+        dot "$DIM"    "Нода      " "${DIM}не установлена${NC}"
     fi
+
+    if [[ -n "$DOMAIN" ]]; then
+        dot "$GREEN" "Сайт      " "${DOMAIN} ${DIM}(${SITE_MODE}${SELFSTEAL_PORT:+ → 127.0.0.1:${SELFSTEAL_PORT}})${NC}"
+    else
+        dot "$DIM"   "Сайт      " "${DIM}нет${NC}"
+    fi
+
+    if [[ -n "$REALITY_PORTS" ]]; then
+        dot "$GREEN" "Hosts     " "порты ${GREEN}${REALITY_PORTS}${NC}"
+    fi
+
     if [[ -f "$COMPOSE_FILE" ]]; then
         if custom_core_active; then
-            core_st="${GREEN}$(host_xray_version)${NC} (своё)"
+            dot "$GREEN" "Ядро Xray " "$(host_xray_version) ${DIM}(своё)${NC}"
         else
-            core_st="${DIM}встроенное в образ${NC}"
+            dot "$DIM"   "Ядро Xray " "${DIM}встроенное в образ${NC}"
         fi
         if certs_mounted; then
-            cert_st="${GREEN}${GRPC_DOMAIN:-проброшены}${NC}"
+            dot "$GREEN" "gRPC/TLS  " "${GRPC_DOMAIN:-сертификаты проброшены}"
         else
-            cert_st="${DIM}нет${NC}"
+            dot "$DIM"   "gRPC/TLS  " "${DIM}сертификаты не проброшены${NC}"
         fi
-        echo -e "  Ядро Xray: ${core_st}    Сертификаты gRPC: ${cert_st}"
     fi
 }
 
-show_menu() {
-    clear
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║          Remnawave Node Installer            ║"
-    echo "  ╚══════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    status_line
-    line
-    echo "  1) Установить чистую ноду Remnawave"
-    echo "  2) Установить ноду + сайт-заглушку (nginx + SSL)"
-    echo "  3) Selfsteal Reality (сайт + конфиг для панели, случайные порты)"
-    line
-    echo "  4) Установить только сайт-заглушку"
-    echo "  5) Обновить / сменить сайт-заглушку"
-    echo "  6) Логи ноды"
-    echo "  7) Обновить ноду"
-    echo "  8) Ядро Xray (обновить / вернуть встроенное)"
-    echo "  9) Сертификаты для gRPC (проброс в ноду)"
-    echo " 10) Установить rkn-guard"
-    echo " 11) Удаление"
-    echo "  0) Выход"
-    line
+main_header() {
+    echo
+    box_edge "╭" "╮"
+    box_row "  REMNAWAVE NODE INSTALLER" "  ${BOLD}REMNAWAVE${NC} ${CYAN}${BOLD}NODE INSTALLER${NC}"
+    box_row "  node | selfsteal | xray-core | certs" "  ${DIM}node | selfsteal | xray-core | certs${NC}"
+    box_edge "╰" "╯"
+    echo -e "   ${DIM}${SERVER_INFO}${NC}"
+    echo
+    echo "$STATUS_CACHE"
+    echo
+}
+
+init_server_info() {
+    local os="" ip
+    [[ -r /etc/os-release ]] && os="$(. /etc/os-release && echo "${PRETTY_NAME:-$NAME}")"
+    ip="$(get_server_ip)"
+    SERVER_INFO="$(hostname) · ${ip:-?}${os:+ · $os}"
 }
 
 main() {
     check_root
     check_os
     load_state
+    init_server_info
+    local choice last="1" rc
     while true; do
-        show_menu
-        local choice; ask choice "Выберите пункт"
+        STATUS_CACHE="$(status_block)"
+        MENU_DEFAULT="$last" menu_select choice full main_header \
+            "---|Установка" \
+            "1|📦 Чистая нода Remnawave|Docker + docker-compose.yml из панели и запуск — без лишних вопросов" \
+            "2|🌐 Нода + сайт-заглушка|Нода, nginx с SSL, сертификаты и фаервол за один проход" \
+            "3|🎭 Selfsteal Reality|Сайт-заглушка + готовый Config Profile со случайными портами для Hosts" \
+            "---|Сайт" \
+            "4|🧱 Только сайт-заглушка|nginx + Let's Encrypt без установки ноды" \
+            "5|🎨 Обновить / сменить сайт|Скачать свежую версию или поставить другой шаблон" \
+            "---|Обслуживание" \
+            "6|📜 Логи ноды|Живой вывод docker compose logs, выход — Ctrl+C" \
+            "7|🔄 Обновить ноду|Скачать свежий образ remnawave/node и перезапустить" \
+            "8|🧬 Ядро Xray|Поставить нужную версию Xray-core или вернуть встроенную" \
+            "9|🔐 Сертификаты gRPC|Пробросить сертификаты Let's Encrypt в контейнер ноды" \
+            "10|🚧 rkn-guard|Запустить сторонний установщик Flecksis/rkn-guard" \
+            "---" \
+            "11|❌ Удаление|Удалить ноду или сайт-заглушку" \
+            "0|🚪 Выход|"
+        [[ "$choice" == "0" ]] && { printf '\e[H\e[2J'; echo -e "  ${CYAN}Пока!${NC}"; exit 0; }
+        last="$choice"
+        action_header "$MENU_LABEL"
+        rc=0
         case "$choice" in
-            1) flow_node;          pause ;;
-            2) flow_node_and_site; pause ;;
-            3) selfsteal_menu;     pause ;;
-            4) flow_site_only;     pause ;;
-            5) update_site_files;  pause ;;
-            6) show_logs;          pause ;;
-            7) update_node;        pause ;;
-            8) core_menu;          pause ;;
-            9) certs_menu;         pause ;;
-            10) run_rkn_guard;     pause ;;
-            11) uninstall_menu;    pause ;;
-            0) echo "Пока!"; exit 0 ;;
-            *) warn "Нет такого пункта"; sleep 1 ;;
+            1)  flow_node ;;
+            2)  flow_node_and_site ;;
+            3)  selfsteal_menu ;;
+            4)  flow_site_only ;;
+            5)  update_site_files ;;
+            6)  show_logs ;;
+            7)  update_node ;;
+            8)  core_menu ;;
+            9)  certs_menu ;;
+            10) run_rkn_guard ;;
+            11) uninstall_menu ;;
         esac
+        rc=$?
+        (( rc == 2 )) || pause      # 2 = «Назад» из подменю — сразу в главное меню
     done
 }
 
