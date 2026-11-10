@@ -13,6 +13,11 @@
 
 set -o pipefail
 
+# Для рамок, логотипа и подсчёта ширины нужна UTF-8 локаль
+if ! locale charmap 2>/dev/null | grep -qi 'utf-\?8'; then
+    export LC_ALL=C.UTF-8
+fi
+
 # ================== НАСТРОЙКИ РЕПОЗИТОРИЯ (ЗАМЕНИТЕ) ==================
 GITHUB_USER="MonopoD123"      # ваш логин на GitHub
 GITHUB_REPO="remnanode-installer"       # имя репозитория
@@ -75,6 +80,7 @@ REALITY_PORTS=""      # все выданные порты inbound'ов (что�
 REALITY_PORT=""
 REALITY_PRIV=""
 REALITY_PUB=""
+SITE_PUBLIC443=""     # 1 — nginx в режиме selfsteal дополнительно отдаёт сайт на публичном 443
 
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
@@ -160,6 +166,48 @@ pause() {
 #   В VAR попадает ключ пункта; q/Esc дают "0". Подпись — в MENU_LABEL.
 #   MENU_DEFAULT=ключ — на каком пункте стоит курсор при открытии.
 MENU_LABEL=""
+
+# Цвета 3D: светлая фаска (верх/лево), тёмная фаска (низ/право), тень
+C_HI=$'\e[38;5;117m'; C_LO=$'\e[38;5;24m'; C_SH=$'\e[38;5;236m'
+C_BTN=$'\e[1;97;48;5;26m'   # «нажатая» кнопка выбранного пункта
+C_BTN_EDGE=$'\e[38;5;39m'
+
+# Рисует панель меню с фаской и падающей тенью.
+# Использует переменные вызывающей menu_select: n mk ml mw sel pw drawn.
+_menu_panel_3d() {
+    local i pad kk bar content sp
+    printf -v bar '%*s' "$pw" ""
+    echo -e "  ${C_HI}┌${bar// /─}${C_LO}┐${NC}"
+    for ((i = 0; i < n; i++)); do
+        if [[ "${mk[$i]}" == "---" ]]; then
+            if [[ -n "${ml[$i]}" ]]; then
+                pad=$(( pw - 3 - mw[i] )); (( pad < 0 )) && pad=0
+                printf -v sp '%*s' "$pad" ""
+                content="  ${MAGENTA}${BOLD}${ml[$i]}${NC} ${sp}"
+            else
+                content="${DIM}${bar// /┄}${NC}"
+            fi
+        else
+            printf -v kk '%2s' "${mk[$i]}"
+            pad=$(( pw - 7 - mw[i] )); (( pad < 0 )) && pad=0
+            printf -v sp '%*s' "$pad" ""
+            if (( i == sel )); then
+                content="${C_BTN} ❯ ${kk}  ${ml[$i]}${C_BTN}${sp}${NC}"
+            else
+                content="   ${DIM}${kk}${NC}  ${ml[$i]}${NC}${sp}"
+            fi
+        fi
+        if (( i == sel )); then
+            echo -e "  ${C_HI}│${NC}${content}${C_LO}│${C_BTN_EDGE}◀${NC}"
+        else
+            echo -e "  ${C_HI}│${NC}${content}${C_LO}│${C_SH}█${NC}"
+        fi
+    done
+    echo -e "  ${C_HI}└${C_LO}${bar// /─}┘${C_SH}█${NC}"
+    echo -e "   ${C_SH}${bar// /▀}▀▀${NC}"
+    drawn=$((drawn + n + 3))
+}
+
 menu_select() {
     local __var="$1" __mode="$2" __title="$3"; shift 3
     local -a mk ml md
@@ -190,6 +238,22 @@ menu_select() {
     }
 
     cols="$(tput cols 2>/dev/null || echo 80)"
+
+    # 3D-панель для полноэкранного меню: ширину подписей считаем один раз
+    # (wc -L учитывает двойную ширину эмодзи), цветовые коды не считаются.
+    local panel=0 pw=0 w
+    local -a mw=()
+    if [[ "$__mode" == "full" && "${MENU_3D:-1}" == "1" ]] && (( cols >= 60 )); then
+        panel=1
+        for ((i = 0; i < n; i++)); do
+            w="$(printf '%s' "${ml[$i]}" | sed 's/\x1b\[[0-9;]*m//g' | wc -L)"
+            mw+=("$w")
+            (( w + 9 > pw )) && pw=$((w + 9))
+        done
+        (( pw < 50 )) && pw=50
+        (( pw > cols - 6 )) && pw=$((cols - 6))
+    fi
+
     printf '\e[?25l' >/dev/tty
     [[ "$__mode" == "inline" ]] && echo -e "${BOLD}${CYAN}?${NC} ${BOLD}${__title}${NC}"
 
@@ -201,7 +265,8 @@ menu_select() {
             printf '\e[%dA\e[J' "$drawn"
         fi
         drawn=0
-        for ((i = 0; i < n; i++)); do
+        (( panel )) && _menu_panel_3d
+        for ((i = 0; i < n && ! panel; i++)); do
             if [[ "${mk[$i]}" == "---" ]]; then
                 if [[ -n "${ml[$i]}" ]]; then
                     echo -e "   ${MAGENTA}${BOLD}${ml[$i]}${NC}"
@@ -361,6 +426,7 @@ SELFSTEAL_PORT="${SELFSTEAL_PORT}"
 GRPC_DOMAIN="${GRPC_DOMAIN}"
 SITE_SOURCE="${SITE_SOURCE}"
 REALITY_PORTS="${REALITY_PORTS}"
+SITE_PUBLIC443="${SITE_PUBLIC443}"
 EOF
     chmod 600 "$STATE_FILE"
 }
@@ -1060,6 +1126,7 @@ detect_ssh_port() {
 setup_firewall() {
     local need_http="${1:-0}" def_ports="443"
     [[ -n "$REALITY_PORTS" ]] && def_ports="$REALITY_PORTS"
+    [[ "$SITE_PUBLIC443" == "1" && " $def_ports " != *" 443 "* ]] && def_ports="443 ${def_ports}"
     [[ -n "$GRPC_DOMAIN" ]] && def_ports+=" ${DEFAULT_GRPC_PORT}"
     echo
     confirm "Настроить фаервол UFW (порт ноды будет открыт только для IP панели)?" n || return 0
@@ -1215,6 +1282,14 @@ check_ports() {
             err "Порт $SELFSTEAL_PORT занят процессом: $owner"
             return 1
         fi
+        if [[ "$SITE_PUBLIC443" == "1" ]]; then
+            owner="$(port_owner 443)"
+            if [[ -n "$owner" && "$owner" != "nginx " ]]; then
+                warn "Порт 443 занят процессом: ${owner}— сайт напрямую на 443 не опубликую."
+                warn "Он будет доступен только через Xray (порт Reality)."
+                SITE_PUBLIC443="0"
+            fi
+        fi
     fi
 }
 
@@ -1294,6 +1369,11 @@ write_nginx_ssl() {
     if has_ipv6; then v6_80="    listen [::]:80;"; fi
     if [[ "$SITE_MODE" == "selfsteal" ]]; then
         listen_443="    listen 127.0.0.1:${SELFSTEAL_PORT} ssl http2;"
+        # Reality не на 443 — сайт открываем и напрямую, чтобы домен работал как обычный сайт
+        if [[ "$SITE_PUBLIC443" == "1" ]]; then
+            listen_443+=$'\n'"    listen 443 ssl http2;"
+            has_ipv6 && v6_443="    listen [::]:443 ssl http2;"
+        fi
     else
         listen_443="    listen 443 ssl http2;"
         has_ipv6 && v6_443="    listen [::]:443 ssl http2;"
@@ -1510,7 +1590,26 @@ generate_selfsteal_config() {
         err "Сайт в режиме Selfsteal не установлен — сначала выполните установку (пункт 1 этого меню)"
         return 1
     fi
-    choose_reality_port || return 1
+    # $1 — порт, уже выбранный в сценарии установки
+    if [[ -n "${1:-}" ]]; then
+        REALITY_PORT="$1"
+    else
+        choose_reality_port || return 1
+    fi
+
+    # 443 может занимать либо nginx (сайт напрямую), либо Reality — не оба сразу
+    if [[ "$REALITY_PORT" == "443" && "$SITE_PUBLIC443" == "1" ]]; then
+        warn "Reality займёт 443 — nginx перестаёт слушать его напрямую."
+        warn "Сайт снова откроется по https://${DOMAIN}, когда профиль с этим inbound применится к ноде."
+        SITE_PUBLIC443="0"
+        write_nginx_ssl || return 1
+    elif [[ "$REALITY_PORT" != "443" && "$SITE_PUBLIC443" != "1" \
+            && " ${REALITY_PORTS} " != *" 443 "* && -z "$(port_owner 443)" ]]; then
+        if confirm "443 свободен — открыть сайт https://${DOMAIN} напрямую через nginx?" y; then
+            SITE_PUBLIC443="1"
+            write_nginx_ssl || return 1
+        fi
+    fi
 
     if ! gen_reality_keys; then
         warn "Не удалось сгенерировать ключи автоматически."
@@ -1549,6 +1648,8 @@ EOF
 
     if ufw_active; then
         ufw allow "${REALITY_PORT}/tcp" >/dev/null && ok "UFW: открыт порт ${REALITY_PORT}/tcp"
+        ufw allow 80/tcp >/dev/null
+        [[ "$SITE_PUBLIC443" == "1" ]] && ufw allow 443/tcp >/dev/null
     fi
 
     line
@@ -1568,10 +1669,86 @@ EOF
     echo -e "${BOLD}4. Internal Squads${NC} → добавить inbound в сквад пользователей"
     line
     echo -e "  Сохранено: ${base}-profile.json / -inbound.json / -host.txt"
+    if [[ "$SITE_PUBLIC443" == "1" ]]; then
+        echo -e "  Сайт: ${GREEN}https://${DOMAIN}${NC} — открывается сразу (nginx на 443)"
+    elif [[ "$REALITY_PORT" == "443" ]]; then
+        echo -e "  Сайт: ${GREEN}https://${DOMAIN}${NC} — откроется, когда профиль применится к ноде (шаг 2)"
+    else
+        echo -e "  Сайт: ${GREEN}https://${DOMAIN}:${REALITY_PORT}${NC} — через Xray, после применения профиля"
+    fi
     if [[ "$REALITY_PORT" != "443" ]]; then
-        echo -e "  ${DIM}Порт не 443: откройте его и в фаерволе хостера, если он есть.${NC}"
+        echo -e "  ${DIM}Порт ${REALITY_PORT} не 443: откройте его и в фаерволе хостера, если он есть.${NC}"
     fi
     line
+}
+
+# Диагностика: почему не открывается сайт
+check_selfsteal_site() {
+    load_state
+    if [[ -z "$DOMAIN" ]]; then err "Сайт не установлен"; return 1; fi
+    local code p owner end
+    _http() {   # _http ПОРТ -> HTTP-код при запросе https://DOMAIN:ПОРТ на этот же сервер
+        curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 6 \
+            --resolve "${DOMAIN}:$1:127.0.0.1" "https://${DOMAIN}:$1/" 2>/dev/null
+    }
+    _good() { [[ "$1" =~ ^(200|301|302|304|403)$ ]]; }
+
+    echo -e "${BOLD}Домен:${NC} ${DOMAIN}"
+    local sip dips
+    sip="$(get_server_ip)"
+    dips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+    if [[ -z "$dips" ]]; then err "Домен не резолвится — нет A-записи на ${sip}"
+    elif [[ " $dips" == *" ${sip} "* ]]; then ok "DNS: ${DOMAIN} → ${sip}"
+    else err "DNS: ${DOMAIN} → ${dips}, а IP сервера ${sip} (Cloudflare-прокси выключен?)"; fi
+
+    if systemctl is-active --quiet nginx; then ok "nginx запущен"; else err "nginx не запущен: systemctl status nginx"; fi
+
+    if [[ -f "${LE_DIR}/live/${DOMAIN}/fullchain.pem" ]]; then
+        end="$(openssl x509 -enddate -noout -in "${LE_DIR}/live/${DOMAIN}/fullchain.pem" 2>/dev/null | cut -d= -f2)"
+        ok "Сертификат есть${end:+, действует до ${end}}"
+    else
+        err "Сертификата для ${DOMAIN} нет"
+    fi
+
+    if [[ -n "$SELFSTEAL_PORT" ]]; then
+        code="$(_http "$SELFSTEAL_PORT")"
+        if _good "$code"; then ok "nginx отвечает на 127.0.0.1:${SELFSTEAL_PORT} (HTTP ${code}) — Reality target в порядке"
+        else err "nginx не отвечает на 127.0.0.1:${SELFSTEAL_PORT} (код ${code:-нет ответа})"; fi
+    fi
+
+    code="$(_http 443)"
+    owner="$(port_owner 443)"
+    if _good "$code"; then
+        ok "https://${DOMAIN} отвечает (HTTP ${code}, порт 443 слушает: ${owner:-?})"
+    else
+        warn "На 443 сайт не отвечает${owner:+ (порт слушает: ${owner})}"
+        [[ -z "$owner" ]] && warn "  443 никто не слушает: либо примените профиль с Reality на 443, либо откройте сайт через пункт «Новый конфиг для Hosts»."
+    fi
+
+    for p in $REALITY_PORTS; do
+        [[ "$p" == "443" ]] && continue
+        owner="$(port_owner "$p")"
+        if [[ -z "$owner" ]]; then
+            warn "Reality-порт ${p} никто не слушает — профиль с ним ещё не применён к ноде в панели"
+            continue
+        fi
+        code="$(_http "$p")"
+        if _good "$code"; then ok "Reality на ${p} отдаёт сайт (HTTP ${code}) — маскировка работает"
+        else warn "Порт ${p} слушает ${owner}, но сайт через него не открылся (код ${code:-нет ответа})"; fi
+    done
+
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
+        ok "Нода remnanode запущена"
+    else
+        warn "Нода remnanode не запущена"
+    fi
+    if ufw_active; then
+        info "UFW включён, разрешённые порты:"
+        ufw status | awk 'NR>4 && /ALLOW/ {print "     " $1}' | sort -u | tr '\n' ' '; echo
+    fi
+    echo -e "  ${DIM}Проверка идёт с самого сервера. Если тут всё зелёное, а снаружи не открывается —${NC}"
+    echo -e "  ${DIM}проверьте фаервол у хостера и что Cloudflare не проксирует домен (серое облако).${NC}"
+    unset -f _http _good
 }
 
 show_selfsteal_configs() {
@@ -1598,17 +1775,34 @@ flow_selfsteal() {
         info "Чтобы просто получить новый порт для Hosts, используйте «Новый конфиг для Hosts»."
         confirm "Всё равно переустановить?" n || return 0
     fi
+    local rc step="${CYAN}${BOLD}"
+    echo -e "${step}Шаг 1/5 · Подготовка сервера${NC}"
     ensure_base_packages || return 1
     install_docker       || return 1
+
+    echo; echo -e "${step}Шаг 2/5 · Нода Remnawave${NC}"
+    configure_node       || return 1
+
+    echo; echo -e "${step}Шаг 3/5 · Порт Reality для Hosts${NC}"
+    # Порты ноды и выданные ранее не должны совпасть со случайным
+    choose_reality_port  || return 1
+    # Reality не на 443 — nginx сам публикует сайт на 443, и он открывается сразу
+    if [[ "$REALITY_PORT" == "443" ]]; then SITE_PUBLIC443="0"; else SITE_PUBLIC443="1"; fi
+
+    echo; echo -e "${step}Шаг 4/5 · Сайт-заглушка и сертификат${NC}"
     SITE_MODE_PRESET="selfsteal"
     install_site
-    local rc=$?
+    rc=$?
     SITE_MODE_PRESET=""
     (( rc == 0 )) || return 1
-    generate_selfsteal_config || return 1
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-        warn "Нода на этом сервере ещё не установлена — поставьте её через пункт 1 главного меню."
-    fi
+    generate_selfsteal_config "$REALITY_PORT" || return 1
+
+    echo; echo -e "${step}Шаг 5/5 · Запуск ноды${NC}"
+    setup_firewall 1
+    start_node || return 1
+    echo
+    check_selfsteal_site
+    node_finish_hint
 }
 
 selfsteal_menu() {
@@ -1620,14 +1814,16 @@ selfsteal_menu() {
         def="2"
     fi
     MENU_DEFAULT="$def" menu_select c inline "Selfsteal Reality" \
-        "1|Установить Selfsteal|Сайт-заглушка на nginx + сертификат + готовый Config Profile" \
+        "1|Установить ноду + Selfsteal|Нода, сайт-заглушка, сертификат и готовый Config Profile за один проход" \
         "2|Новый конфиг для Hosts|Новый случайный порт, ключи x25519 и shortId" \
         "3|Показать сохранённые конфиги|Все выданные порты и настройки хостов" \
+        "4|Проверить сайт|DNS, nginx, сертификат, порты Reality — почему сайт не открывается" \
         "0|Назад|"
     case "$c" in
         1) flow_selfsteal ;;
         2) generate_selfsteal_config ;;
         3) show_selfsteal_configs ;;
+        4) check_selfsteal_site ;;
         *) return 2 ;;
     esac
 }
@@ -1824,13 +2020,72 @@ status_block() {
     fi
 }
 
+# ----------------------- 3D-логотип (шрифт ANSI Shadow) --------------
+# Блоки █ — «лицевая» сторона с градиентом, линии ╗╔═║ — тень букв.
+glyph() {   # glyph БУКВА СТРОКА -> GLYPH
+    local -a g
+    case "$1" in
+        R) g=("██████╗ " "██╔══██╗" "██████╔╝" "██╔══██╗" "██║  ██║" "╚═╝  ╚═╝") ;;
+        E) g=("███████╗" "██╔════╝" "█████╗  " "██╔══╝  " "███████╗" "╚══════╝") ;;
+        M) g=("███╗   ███╗" "████╗ ████║" "██╔████╔██║" "██║╚██╔╝██║" "██║ ╚═╝ ██║" "╚═╝     ╚═╝") ;;
+        N) g=("███╗   ██╗" "████╗  ██║" "██╔██╗ ██║" "██║╚██╗██║" "██║ ╚████║" "╚═╝  ╚═══╝") ;;
+        A) g=(" █████╗ " "██╔══██╗" "███████║" "██╔══██║" "██║  ██║" "╚═╝  ╚═╝") ;;
+        W) g=("██╗    ██╗" "██║    ██║" "██║ █╗ ██║" "██║███╗██║" "╚███╔███╔╝" " ╚══╝╚══╝ ") ;;
+        V) g=("██╗   ██╗" "██║   ██║" "██║   ██║" "╚██╗ ██╔╝" " ╚████╔╝ " "  ╚═══╝  ") ;;
+        O) g=(" ██████╗ " "██╔═══██╗" "██║   ██║" "██║   ██║" "╚██████╔╝" " ╚═════╝ ") ;;
+        D) g=("██████╗ " "██╔══██╗" "██║  ██║" "██║  ██║" "██████╔╝" "╚═════╝ ") ;;
+        *) g=("  " "  " "  " "  " "  " "  ") ;;
+    esac
+    GLYPH="${g[$2]}"
+}
+
+# build_banner СЛОВО -> текст логотипа с градиентом сверху вниз
+build_banner() {
+    local word="$1" r j i ch want cur row out=""
+    local -a grad=(87 81 75 69 63 99)
+    for ((r = 0; r < 6; r++)); do
+        row=""
+        for ((j = 0; j < ${#word}; j++)); do
+            glyph "${word:j:1}" "$r"
+            row+="$GLYPH"
+        done
+        out+="  "; cur=""
+        for ((i = 0; i < ${#row}; i++)); do
+            ch="${row:i:1}"
+            if [[ "$ch" == " " ]]; then out+=" "; continue; fi
+            if [[ "$ch" == "█" ]]; then want=$'\e[1;38;5;'"${grad[$r]}m"; else want=$'\e[38;5;239m'; fi
+            [[ "$want" != "$cur" ]] && { out+="$want"; cur="$want"; }
+            out+="$ch"
+        done
+        out+="${NC}"$'\n'
+    done
+    printf '%s' "$out"
+}
+
+BANNER_BIG=""; BANNER_SMALL=""
+init_banners() {
+    BANNER_BIG="$(build_banner REMNAWAVE)"
+    BANNER_SMALL="$(build_banner NODE)"
+}
+
 main_header() {
+    local c; c="$(tput cols 2>/dev/null || echo 80)"
     echo
-    box_edge "╭" "╮"
-    box_row "  REMNAWAVE NODE INSTALLER" "  ${BOLD}REMNAWAVE${NC} ${CYAN}${BOLD}NODE INSTALLER${NC}"
-    box_row "  node | selfsteal | xray-core | certs" "  ${DIM}node | selfsteal | xray-core | certs${NC}"
-    box_edge "╰" "╯"
-    echo -e "   ${DIM}${SERVER_INFO}${NC}"
+    if [[ "${MENU_3D:-1}" == "1" ]] && (( c >= 86 )); then
+        echo "$BANNER_BIG"
+        echo -e "  ${C_SH}▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀${NC}"
+        echo -e "  ${BOLD}N O D E   I N S T A L L E R${NC}   ${DIM}node · selfsteal · xray-core · certs${NC}"
+    elif [[ "${MENU_3D:-1}" == "1" ]] && (( c >= 50 )); then
+        echo "$BANNER_SMALL"
+        echo -e "  ${BOLD}REMNAWAVE${NC} ${DIM}node installer${NC}"
+    else
+        BOX_W=$(( c - 5 )); (( BOX_W > 50 )) && BOX_W=50; (( BOX_W < 40 )) && BOX_W=40
+        box_edge "╭" "╮"
+        box_row "  REMNAWAVE NODE INSTALLER" "  ${BOLD}REMNAWAVE${NC} ${CYAN}${BOLD}NODE INSTALLER${NC}"
+        box_row "  node | selfsteal | xray-core | certs" "  ${DIM}node | selfsteal | xray-core | certs${NC}"
+        box_edge "╰" "╯"
+    fi
+    echo -e "  ${DIM}${SERVER_INFO}${NC}"
     echo
     echo "$STATUS_CACHE"
     echo
@@ -1848,6 +2103,7 @@ main() {
     check_os
     load_state
     init_server_info
+    init_banners
     local choice last="1" rc
     while true; do
         STATUS_CACHE="$(status_block)"
@@ -1855,7 +2111,7 @@ main() {
             "---|Установка" \
             "1|📦 Чистая нода Remnawave|Docker + docker-compose.yml из панели и запуск — без лишних вопросов" \
             "2|🌐 Нода + сайт-заглушка|Нода, nginx с SSL, сертификаты и фаервол за один проход" \
-            "3|🎭 Selfsteal Reality|Сайт-заглушка + готовый Config Profile со случайными портами для Hosts" \
+            "3|🎭 Selfsteal Reality|Нода + сайт-заглушка + готовый Config Profile со случайными портами для Hosts" \
             "---|Сайт" \
             "4|🧱 Только сайт-заглушка|nginx + Let's Encrypt без установки ноды" \
             "5|🎨 Обновить / сменить сайт|Скачать свежую версию или поставить другой шаблон" \
