@@ -551,7 +551,10 @@ EOF
     fi
     NODE_PORT="$(get_node_port)"
     ok "Конфиг сохранён: $COMPOSE_FILE (NODE_PORT=${NODE_PORT:-не найден})"
-    certs_mounted && info "Сертификаты из ${LE_DIR} остаются проброшенными (через ${OVERRIDE_FILE})"
+    if certs_mounted; then
+        info "Сертификаты из ${LE_DIR} остаются проброшенными (через ${OVERRIDE_FILE})"
+    fi
+    return 0
 }
 
 start_node() {
@@ -1776,16 +1779,17 @@ flow_selfsteal() {
         confirm "Всё равно переустановить?" n || return 0
     fi
     local rc step="${CYAN}${BOLD}"
+    stopped() { echo; err "Установка Selfsteal остановлена на шаге $1/5 — причина в сообщениях выше."; }
     echo -e "${step}Шаг 1/5 · Подготовка сервера${NC}"
-    ensure_base_packages || return 1
-    install_docker       || return 1
+    ensure_base_packages || { stopped 1; return 1; }
+    install_docker       || { stopped 1; return 1; }
 
     echo; echo -e "${step}Шаг 2/5 · Нода Remnawave${NC}"
-    configure_node       || return 1
+    configure_node       || { stopped 2; return 1; }
 
     echo; echo -e "${step}Шаг 3/5 · Порт Reality для Hosts${NC}"
     # Порты ноды и выданные ранее не должны совпасть со случайным
-    choose_reality_port  || return 1
+    choose_reality_port  || { stopped 3; return 1; }
     # Reality не на 443 — nginx сам публикует сайт на 443, и он открывается сразу
     if [[ "$REALITY_PORT" == "443" ]]; then SITE_PUBLIC443="0"; else SITE_PUBLIC443="1"; fi
 
@@ -1794,12 +1798,12 @@ flow_selfsteal() {
     install_site
     rc=$?
     SITE_MODE_PRESET=""
-    (( rc == 0 )) || return 1
-    generate_selfsteal_config "$REALITY_PORT" || return 1
+    (( rc == 0 )) || { stopped 4; return 1; }
+    generate_selfsteal_config "$REALITY_PORT" || { stopped 4; return 1; }
 
     echo; echo -e "${step}Шаг 5/5 · Запуск ноды${NC}"
     setup_firewall 1
-    start_node || return 1
+    start_node || { stopped 5; return 1; }
     echo
     check_selfsteal_site
     node_finish_hint
