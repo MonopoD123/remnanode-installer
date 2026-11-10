@@ -1486,14 +1486,15 @@ selfsteal_menu() {
 # Нода запускается последним шагом: к этому моменту уже готовы
 # сайт, сертификаты (и их монтирование в override) и фаервол,
 # поэтому контейнер стартует сразу с итоговой конфигурацией.
+# Чистая нода: только Docker + docker-compose.yml из панели + запуск.
+# Без сайта, сертификатов, фаервола и дополнительных вопросов.
 flow_node() {
     ensure_base_packages || return 1
     install_docker       || return 1
     configure_node       || return 1
-    setup_grpc_certs "$GRPC_DOMAIN" 1
-    if [[ -n "$GRPC_DOMAIN" ]]; then setup_firewall 1; else setup_firewall 0; fi
     start_node           || return 1
     node_finish_hint
+    echo -e "  ${DIM}Сертификаты для gRPC — пункт 9, сайт-заглушка — пункты 3/4.${NC}"
 }
 
 flow_node_and_site() {
@@ -1657,7 +1658,7 @@ show_menu() {
     echo -e "${NC}"
     status_line
     line
-    echo "  1) Установить ноду Remnawave"
+    echo "  1) Установить чистую ноду Remnawave"
     echo "  2) Установить ноду + сайт-заглушку (nginx + SSL)"
     echo "  3) Selfsteal Reality (сайт + конфиг для панели, случайные порты)"
     line
