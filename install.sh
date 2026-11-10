@@ -82,6 +82,7 @@ REALITY_PRIV=""
 REALITY_PUB=""
 SITE_PUBLIC443=""     # 1 — nginx в режиме selfsteal дополнительно отдаёт сайт на публичном 443
 BLOCK_RU=""           # 1 — блокировать российские сайты через ноду (по умолчанию)
+SELFSTEAL_PROTO=""    # both | tcp | grpc — какие inbound'ы генерировать
 
 # ------------------------------ Оформление ----------------------------
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'
@@ -432,6 +433,7 @@ SITE_SOURCE="${SITE_SOURCE}"
 REALITY_PORTS="${REALITY_PORTS}"
 SITE_PUBLIC443="${SITE_PUBLIC443}"
 BLOCK_RU="${BLOCK_RU}"
+SELFSTEAL_PROTO="${SELFSTEAL_PROTO}"
 EOF
     chmod 600 "$STATE_FILE"
 }
@@ -1792,6 +1794,66 @@ make_inbound_json() {
 EOF
 }
 
+# make_grpc_inbound_json TAG PORT PRIVKEY SHORTID SNI TARGET SERVICENAME
+# gRPC несовместим с Vision: flow явно пустой, иначе панель может подставить
+# xtls-rprx-vision и клиенты не подключатся.
+make_grpc_inbound_json() {
+    cat <<EOF
+{
+  "tag": "$1",
+  "port": $2,
+  "listen": "0.0.0.0",
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none",
+    "flow": ""
+  },
+  "sniffing": {
+    "enabled": true,
+    "routeOnly": true,
+    "destOverride": ["http", "tls", "quic"]
+  },
+  "streamSettings": {
+    "network": "grpc",
+    "grpcSettings": {
+      "serviceName": "$7",
+      "multiMode": false
+    },
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "xver": 0,
+      "target": "$6",
+      "spiderX": "",
+      "shortIds": ["$4"],
+      "privateKey": "$3",
+      "serverNames": ["$5"]
+    }
+  }
+}
+EOF
+}
+
+# serviceName для gRPC: не «grpc» по умолчанию, а случайное имя в стиле API
+gen_service_name() {
+    local -a pre=(api app sync data media feed core user stream event)
+    local -a suf=(Service Gateway Stream Sync Api Hub)
+    printf '%s.v%d.%s%s' "${pre[$((RANDOM % ${#pre[@]}))]}" "$((RANDOM % 3 + 1))" \
+        "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')" "${suf[$((RANDOM % ${#suf[@]}))]}"
+}
+
+# profile_inbounds BASE — все inbound'ы конфига через запятую (для make_profile_json)
+profile_inbounds() {
+    local f out=""
+    for f in "$1-inbound.json" "$1-grpc-inbound.json"; do
+        [[ -f "$f" ]] || continue
+        [[ -n "$out" ]] && out+=$',\n'
+        out+="$(cat "$f")"
+    done
+    printf '%s' "$out"
+}
+
 # make_profile_json "<inbound json>" [блокировать_ru 1|0]
 #   log.access none      — журнал подключений не пишется
 #   dns DoH              — сервер резолвит домены не через DNS хостера
@@ -1872,7 +1934,7 @@ check_and_fix_profile() {
             if grep -qiE 'category-ru|geoip:ru|geosite|geoip' <<<"$VALIDATE_OUT" \
                     && grep -q 'category-ru' "${base}-profile.json"; then
                 warn "В geo-файлах ноды нет списков для России — убираю RU-правила из профиля."
-                make_profile_json "$(cat "${base}-inbound.json")" 0 >"${base}-profile.json"
+                make_profile_json "$(profile_inbounds "$base")" 0 >"${base}-profile.json"
                 BLOCK_RU="0"; save_state
                 if validate_profile "${base}-profile.json"; then
                     ok "Исправленный профиль проверен — ошибок нет"
@@ -1973,40 +2035,87 @@ generate_selfsteal_config() {
         "0|Пропускать|Всё идёт через ноду, но IP сервера могут занести в списки"
     [[ "$ru" == "1" ]] && BLOCK_RU="1" || BLOCK_RU="0"
 
-    local sid tag inbound base
+    # Протоколы: TCP+Vision — основной; gRPC — запасной (другой вид трафика,
+    # помогает, если TCP-вариант режут). Оба — Reality на тот же сайт-заглушку.
+    local proto
+    echo
+    MENU_DEFAULT="${SELFSTEAL_PROTO:-both}" menu_select proto inline "Протоколы в профиле" \
+        "both|TCP Vision + gRPC (рекомендуется)|Два inbound'а на разных портах: основной и запасной" \
+        "tcp|Только TCP Vision|Один inbound — самый быстрый вариант" \
+        "grpc|Только gRPC|Без Vision; трафик похож на обычный HTTP/2 API"
+    [[ "$proto" == "0" ]] && { info "Отменено"; return 1; }
+    SELFSTEAL_PROTO="$proto"
+
+    local sid tag inbound base gsid gtag ginbound gport="" gservice inbounds=""
     sid="$(gen_short_id)"
     tag="VLESS_REALITY_SELFSTEAL_${REALITY_PORT}"
     inbound="$(make_inbound_json "$tag" "$REALITY_PORT" "$REALITY_PRIV" "$sid" "$DOMAIN" "127.0.0.1:${SELFSTEAL_PORT}")"
 
+    if [[ "$proto" != "tcp" ]]; then
+        if [[ "$proto" == "grpc" ]]; then
+            gport="$REALITY_PORT"         # только gRPC — он и занимает выбранный порт
+        else
+            # Отдельный случайный порт: выбранный TCP-порт считаем уже занятым
+            gport="$(REALITY_PORTS="${REALITY_PORTS} ${REALITY_PORT}" random_free_port "$REALITY_PORT_MIN" "$REALITY_PORT_MAX")" \
+                || { err "Не удалось подобрать порт для gRPC"; return 1; }
+        fi
+        gsid="$(gen_short_id)"
+        gservice="$(gen_service_name)"
+        gtag="VLESS_GRPC_REALITY_${gport}"
+        ginbound="$(make_grpc_inbound_json "$gtag" "$gport" "$REALITY_PRIV" "$gsid" "$DOMAIN" "127.0.0.1:${SELFSTEAL_PORT}" "$gservice")"
+    fi
+
     mkdir -p "$SELFSTEAL_CFG_DIR"
     chmod 700 "$SELFSTEAL_CFG_DIR"
     base="${SELFSTEAL_CFG_DIR}/${REALITY_PORT}"
-    printf '%s\n' "$inbound" >"${base}-inbound.json"
-    make_profile_json "$inbound" "$BLOCK_RU" >"${base}-profile.json"
+    rm -f "${base}-inbound.json" "${base}-grpc-inbound.json"
+    [[ "$proto" != "grpc" ]] && printf '%s\n' "$inbound" >"${base}-inbound.json"
+    [[ -n "$gport" ]] && printf '%s\n' "$ginbound" >"${base}-grpc-inbound.json"
+    inbounds="$(profile_inbounds "$base")"
+    make_profile_json "$inbounds" "$BLOCK_RU" >"${base}-profile.json"
     if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${base}-profile.json" 2>/dev/null; then
         err "Сгенерированный профиль — невалидный JSON (${base}-profile.json). Сообщите об ошибке."
         return 1
     fi
-    cat >"${base}-host.txt" <<EOF
-Создан:        $(date '+%Y-%m-%d %H:%M')
-Inbound tag:   ${tag}
-Address:       ${DOMAIN}
-Port:          ${REALITY_PORT}
-SNI:           ${DOMAIN}
-Fingerprint:   chrome
-Public key:    ${REALITY_PUB}
-Short ID:      ${sid}
-Reality target: 127.0.0.1:${SELFSTEAL_PORT}
-EOF
+
+    {
+        echo "Создан:         $(date '+%Y-%m-%d %H:%M')"
+        echo "Public key:     ${REALITY_PUB}"
+        echo "Reality target: 127.0.0.1:${SELFSTEAL_PORT}"
+        if [[ "$proto" != "grpc" ]]; then
+            echo
+            echo "[TCP + Vision]"
+            echo "Inbound tag:    ${tag}"
+            echo "Address:        ${DOMAIN}"
+            echo "Port:           ${REALITY_PORT}"
+            echo "SNI:            ${DOMAIN}"
+            echo "Fingerprint:    chrome"
+            echo "Short ID:       ${sid}"
+        fi
+        if [[ -n "$gport" ]]; then
+            echo
+            echo "[gRPC]"
+            echo "Inbound tag:    ${gtag}"
+            echo "Address:        ${DOMAIN}"
+            echo "Port:           ${gport}"
+            echo "SNI:            ${DOMAIN}"
+            echo "Fingerprint:    chrome"
+            echo "serviceName:    ${gservice}"
+            echo "Short ID:       ${gsid}"
+        fi
+    } >"${base}-host.txt"
     chmod 600 "${base}"-*
 
-    if [[ " ${REALITY_PORTS} " != *" ${REALITY_PORT} "* ]]; then
-        REALITY_PORTS="${REALITY_PORTS:+$REALITY_PORTS }${REALITY_PORT}"
-    fi
+    local p
+    for p in $([[ "$proto" != "grpc" ]] && echo "$REALITY_PORT") $gport; do
+        [[ " ${REALITY_PORTS} " != *" ${p} "* ]] && REALITY_PORTS="${REALITY_PORTS:+$REALITY_PORTS }${p}"
+    done
     save_state
 
     if ufw_active; then
-        ufw allow "${REALITY_PORT}/tcp" >/dev/null && ok "UFW: открыт порт ${REALITY_PORT}/tcp"
+        for p in $([[ "$proto" != "grpc" ]] && echo "$REALITY_PORT") $gport; do
+            ufw allow "${p}/tcp" >/dev/null && ok "UFW: открыт порт ${p}/tcp"
+        done
         ufw allow 80/tcp >/dev/null
         [[ "$SITE_PUBLIC443" == "1" ]] && ufw allow 443/tcp >/dev/null
     fi
@@ -2016,18 +2125,25 @@ EOF
     line
     cat "${base}-profile.json"
     line
-    echo -e "${DIM}Только inbound (чтобы добавить в существующий профиль): ${base}-inbound.json${NC}"
+    echo -e "${DIM}Только inbound'ы (чтобы добавить в существующий профиль): ${base}-inbound.json${gport:+, ${base}-grpc-inbound.json}${NC}"
     echo
-    echo -e "${BOLD}2. Nodes${NC} → нода → выбрать профиль и отметить inbound ${CYAN}${tag}${NC}"
-    echo -e "${BOLD}3. Hosts${NC} → создать хост:"
-    echo -e "     Inbound:     ${tag}"
-    echo -e "     Address:     ${DOMAIN}"
-    echo -e "     Port:        ${GREEN}${REALITY_PORT}${NC}"
-    echo -e "     SNI:         ${DOMAIN}"
-    echo -e "     Fingerprint: chrome"
-    echo -e "${BOLD}4. Internal Squads${NC} → добавить inbound в сквад пользователей"
+    local tags=""
+    [[ "$proto" != "grpc" ]] && tags="${CYAN}${tag}${NC}"
+    [[ -n "$gport" ]] && tags+="${tags:+ и }${CYAN}${gtag}${NC}"
+    echo -e "${BOLD}2. Nodes${NC} → нода → выбрать профиль и отметить ${tags}"
+    echo -e "${BOLD}3. Hosts${NC} → создать хост${gport:+ для каждого inbound}:"
+    if [[ "$proto" != "grpc" ]]; then
+        echo -e "     ${BOLD}TCP Vision${NC}  Inbound: ${tag}"
+        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${REALITY_PORT}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+    fi
+    if [[ -n "$gport" ]]; then
+        echo -e "     ${BOLD}gRPC${NC}        Inbound: ${gtag}"
+        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${gport}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+        echo -e "                 ${DIM}serviceName (${gservice}) панель берёт из inbound сама${NC}"
+    fi
+    echo -e "${BOLD}4. Internal Squads${NC} → добавить inbound'ы в сквад пользователей"
     line
-    echo -e "  Сохранено: ${base}-profile.json / -inbound.json / -host.txt"
+    echo -e "  Сохранено: ${base}-profile.json / -host.txt"
     if [[ "$SITE_PUBLIC443" == "1" ]]; then
         echo -e "  Сайт: ${GREEN}https://${DOMAIN}${NC} — открывается сразу (nginx на 443)"
     elif [[ "$REALITY_PORT" == "443" ]]; then
@@ -2053,7 +2169,13 @@ security_notes() {
         echo -e "  ${YELLOW}!${NC} Порт ${REALITY_PORT}: долгий TLS на высокий порт заметнее для DPI."
         echo -e "    ${DIM}Для основного хоста лучше 443, случайные порты — для запасных.${NC}"
     fi
-    echo -e "  ${YELLOW}!${NC} В ссылке подписки должен быть ${BOLD}flow=xtls-rprx-vision${NC} (без Vision виден «TLS внутри TLS»)"
+    if [[ "${SELFSTEAL_PROTO:-both}" != "grpc" ]]; then
+        echo -e "  ${GREEN}✓${NC} TCP: flow=xtls-rprx-vision прописан в inbound — проверьте, что он есть в ссылке подписки"
+    fi
+    if [[ "${SELFSTEAL_PROTO:-both}" != "tcp" ]]; then
+        echo -e "  ${GREEN}✓${NC} gRPC: flow пустой (Vision с gRPC не работает), serviceName случайный, не «grpc»"
+        echo -e "    ${DIM}gRPC — запасной вариант: чуть медленнее TCP Vision, но выглядит как обычный HTTP/2 API${NC}"
+    fi
     if guard_active; then
         echo -e "  ${GREEN}✓${NC} Порт ноды ${np} открыт только для панели"
     else
