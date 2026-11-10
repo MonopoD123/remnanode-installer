@@ -3,7 +3,7 @@
 #  Remnawave Node Installer
 #  1) Установка ноды Remnawave (по https://docs.rw/install/remnawave-node)
 #  2) Установка ноды + сайт-заглушка на nginx с SSL (Let's Encrypt)
-#     (на выбор: «Радио», игра «Курятник» или свой zip)
+#     (на выбор: «Радио», игра «Курятник», «Клипотека» или свой zip)
 #  3) Selfsteal Reality: сайт-заглушка + готовый Config Profile для панели
 #     со случайными портами (каждый запуск — новый порт для Hosts)
 #  4) Установка / обновление ядра Xray-core на ноде
@@ -23,8 +23,8 @@ GITHUB_USER="MonopoD123"      # ваш логин на GitHub
 GITHUB_REPO="remnanode-installer"       # имя репозитория
 GITHUB_BRANCH="main"                    # ветка
 # Архивы сайтов-заглушек в корне репозитория
-SITE_TEMPLATES=("radio.zip" "eggs.zip")
-SITE_TEMPLATE_TITLES=("Радио" "Игра «Курятник» (лови яйца, LCD-стиль)")
+SITE_TEMPLATES=("radio.zip" "eggs.zip" "tube.zip")
+SITE_TEMPLATE_TITLES=("Радио" "Игра «Курятник» (лови яйца, LCD-стиль)" "Клипотека — топ видео с YouTube")
 # ======================================================================
 
 REPO_RAW="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
