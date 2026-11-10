@@ -1927,7 +1927,8 @@ profile_inbounds() {
 
 # make_profile_json "<inbound json>" [блокировать_ru 1|0]
 #   log.access none      — журнал подключений не пишется
-#   dns DoH              — сервер резолвит домены не через DNS хостера
+#   dns DoH              — сервер резолвит домены не через DNS хостера;
+#                          localhost — запасной системный DNS, если DoH заблокирован
 #   UseIPv4              — без внезапных выходов по IPv6
 #   geoip:private        — нет доступа к внутренней сети сервера через туннель
 #   bittorrent           — нет жалоб правообладателей хостеру
@@ -1947,7 +1948,8 @@ make_profile_json() {
   "dns": {
     "servers": [
       "https+local://1.1.1.1/dns-query",
-      "https+local://8.8.8.8/dns-query"
+      "https+local://8.8.8.8/dns-query",
+      "localhost"
     ],
     "queryStrategy": "UseIPv4"
   },
@@ -2318,9 +2320,43 @@ check_selfsteal_site() {
 
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; then
         ok "Нода remnanode запущена"
+        # Xray не смог занять порт — самая частая причина «нет пинга»
+        local busy
+        busy="$(docker logs --tail 300 remnanode 2>&1 | grep -iE 'address already in use|failed to listen' | tail -n 3)"
+        if [[ -n "$busy" ]]; then
+            err "Xray не смог занять порт — inbound не работает, пинга не будет:"
+            sed 's/^/     /' <<<"$busy"
+        fi
     else
         warn "Нода remnanode не запущена"
     fi
+
+    # Конфликт: Reality хочет 443, а его держит nginx (сайт напрямую)
+    if [[ "$(port_owner 443)" == "nginx " ]] && [[ " ${REALITY_PORTS} " == *" 443 "* || -n "${busy:-}" ]]; then
+        err "Порт 443 занят nginx, а профиль ноды использует Reality на 443 — Xray не запускается."
+        if confirm "Освободить 443 для Xray (сайт будет открываться через Reality)?" y; then
+            SITE_PUBLIC443="0"; save_state
+            if write_nginx_ssl; then
+                ok "nginx больше не слушает 443"
+                node_running && node_restart
+            fi
+        fi
+    fi
+
+    # DoH из профиля должен быть доступен с сервера, иначе Xray не резолвит домены
+    local doh_ok=0
+    curl -s --noproxy '*' --max-time 5 -H 'accept: application/dns-json' \
+        'https://1.1.1.1/dns-query?name=google.com&type=A' 2>/dev/null | grep -q '"Status":0' && doh_ok=1
+    curl -s --noproxy '*' --max-time 5 'https://8.8.8.8/resolve?name=google.com&type=A' 2>/dev/null \
+        | grep -q '"Status":0' && doh_ok=$((doh_ok + 1))
+    case $doh_ok in
+        2) ok "DoH 1.1.1.1 и 8.8.8.8 доступны с сервера" ;;
+        1) warn "Доступен только один DoH-сервер — DNS в Xray будет работать, но медленнее" ;;
+        0) err "DoH 1.1.1.1 и 8.8.8.8 недоступны с сервера — без запасного DNS Xray не резолвит сайты."
+           warn "  Сгенерируйте профиль заново («Новый конфиг для Hosts») — в нём есть запасной DNS «localhost»," ;;
+    esac
+    (( doh_ok == 0 )) && warn "  или добавьте \"localhost\" в dns.servers текущего профиля в панели."
+
     if ufw_active; then
         info "UFW включён, разрешённые порты:"
         ufw status | awk 'NR>4 && /ALLOW/ {print "     " $1}' | sort -u | tr '\n' ' '; echo
