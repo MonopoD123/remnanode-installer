@@ -1144,44 +1144,6 @@ certs_menu() {
     esac
 }
 
-# ============================ ФАЕРВОЛ =================================
-detect_ssh_port() {
-    local p
-    p="$(ss -tlnpH 2>/dev/null | grep '"sshd"' | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)"
-    echo "${p:-22}"
-}
-
-setup_firewall() {
-    local need_http="${1:-0}" def_ports="443"
-    [[ -n "$REALITY_PORTS" ]] && def_ports="$REALITY_PORTS"
-    [[ "$SITE_PUBLIC443" == "1" && " $def_ports " != *" 443 "* ]] && def_ports="443 ${def_ports}"
-    [[ -n "$GRPC_DOMAIN" ]] && def_ports+=" ${DEFAULT_GRPC_PORT}"
-    echo
-    confirm "Настроить фаервол UFW (порт ноды будет открыт только для IP панели)?" n || return 0
-
-    if [[ -z "$NODE_PORT" ]]; then
-        ask NODE_PORT "NODE_PORT ноды" "2222"
-    fi
-    local panel_ip ssh_port extra p
-    ask panel_ip "IP-адрес сервера с панелью Remnawave"
-    if [[ -z "$panel_ip" ]]; then err "IP панели не указан — пропускаю настройку UFW"; return 1; fi
-    ssh_port="$(detect_ssh_port)"
-    ask ssh_port "SSH-порт (не ошибитесь, иначе потеряете доступ!)" "$ssh_port"
-    ask extra "Публичные порты inbound'ов Xray через пробел" "$def_ports"
-
-    apt_install ufw || { err "Не удалось установить ufw"; return 1; }
-    ufw allow "${ssh_port}/tcp" >/dev/null
-    [[ "$need_http" == "1" ]] && ufw allow 80/tcp >/dev/null
-    for p in $extra; do ufw allow "${p}/tcp" >/dev/null; done
-    if ! ufw allow from "$panel_ip" to any port "$NODE_PORT" proto tcp >/dev/null; then
-        err "Не удалось добавить правило для панели ($panel_ip)"
-        return 1
-    fi
-    ufw --force enable >/dev/null
-    ok "UFW включён"
-    ufw status numbered
-}
-
 # ============================ САЙТ ====================================
 # Локальный порт nginx для Reality target: по умолчанию — случайный
 ask_selfsteal_port() {
@@ -1872,7 +1834,6 @@ flow_selfsteal() {
     generate_selfsteal_config "$REALITY_PORT" || { stopped 4; return 1; }
 
     echo; echo -e "${step}Шаг 5/5 · Запуск ноды${NC}"
-    setup_firewall 1
     start_node || { stopped 5; return 1; }
     echo
     check_selfsteal_site
@@ -1926,7 +1887,6 @@ flow_node_and_site() {
         confirm "Продолжить установку ноды без сайта?" y || return 1
     fi
     setup_grpc_certs "${DOMAIN:-$GRPC_DOMAIN}" 1
-    setup_firewall 1
     start_node           || return 1
     node_finish_hint
 }
