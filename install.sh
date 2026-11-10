@@ -2422,6 +2422,72 @@ flow_selfsteal() {
     node_finish_hint
 }
 
+# Проверка соответствия схеме SelfSteal — так же, как проверяет хостер:
+# на каждый TLS-порт Xray подключаемся с разными SNI и смотрим, чей сертификат вернулся.
+# При SelfSteal на ЛЮБОМ порту и ЛЮБОМ SNI должен быть сертификат только своего домена.
+selfsteal_audit() {
+    load_state
+    if [[ -z "$DOMAIN" ]]; then err "Домен Selfsteal не настроен — сначала пункт 1 этого меню"; return 1; fi
+    command -v openssl >/dev/null 2>&1 || apt_install openssl || { err "Нужен openssl"; return 1; }
+
+    local -a ports=() snis=("$DOMAIN" "www.microsoft.com" "www.google.com" "dl.google.com" "")
+    local p sni subj bad=0 checked=0 line_out
+
+    # Порты, которые слушает Xray ноды (+ выданные скриптом и 443)
+    while read -r p; do [[ -n "$p" ]] && ports+=("$p"); done < <(
+        { ss -tlnpH 2>/dev/null | grep -E '"(xray|rw-core|remnanode)"' | awk '{print $4}' | grep -oE '[0-9]+$'
+          for p in $REALITY_PORTS 443; do echo "$p"; done; } | sort -un)
+
+    echo -e "${BOLD}Домен SelfSteal:${NC} ${DOMAIN}"
+    echo -e "${DIM}Для каждого порта: какой сертификат сервер отдаёт на разные SNI (как при проверке хостером)${NC}"
+    line
+    for p in "${ports[@]}"; do
+        [[ -z "$(port_owner "$p")" ]] && continue
+        [[ "$p" == "$NODE_PORT" || "$p" == "$(get_node_port)" ]] && continue   # API ноды — не TLS-маскировка
+        echo -e "${BOLD}Порт ${p}${NC} ${DIM}($(port_owner "$p"))${NC}"
+        for sni in "${snis[@]}"; do
+            if [[ -n "$sni" ]]; then
+                subj="$(timeout 8 openssl s_client -connect "127.0.0.1:${p}" -servername "$sni" </dev/null 2>/dev/null \
+                        | openssl x509 -noout -subject -ext subjectAltName 2>/dev/null | tr '\n' ' ')"
+            else
+                subj="$(timeout 8 openssl s_client -connect "127.0.0.1:${p}" -noservername </dev/null 2>/dev/null \
+                        | openssl x509 -noout -subject -ext subjectAltName 2>/dev/null | tr '\n' ' ')"
+            fi
+            local lbl="${sni:-(без SNI)}" padn
+            padn=$(( 20 - ${#lbl} )); (( padn < 1 )) && padn=1
+            printf -v line_out '  SNI %s%*s → ' "$lbl" "$padn" ""
+            if [[ -z "$subj" ]]; then
+                echo -e "${line_out}${DIM}нет TLS-ответа${NC}"
+            elif grep -qF "$DOMAIN" <<<"$subj"; then
+                echo -e "${line_out}${GREEN}свой сертификат ✓${NC}"
+            else
+                echo -e "${line_out}${RED}ЧУЖОЙ: $(grep -oE 'CN ?= ?[^,/ ]+' <<<"$subj" | head -1)${NC}"
+                bad=1
+            fi
+            checked=1
+        done
+    done
+    line
+    if (( ! checked )); then
+        warn "Не найдено ни одного TLS-порта Xray — нода не запущена или профиль не применён."
+        return 1
+    fi
+    if (( bad )); then
+        err "Найдены порты с ЧУЖИМ сертификатом — это и есть нарушение «маскировка через чужие ресурсы»."
+        echo -e "  Исправьте в панели Remnawave для ЭТОЙ ноды:"
+        echo -e "  1) ${BOLD}Config Profiles${NC}: у каждого Reality-inbound'а"
+        echo -e "       target       = ${GREEN}127.0.0.1:${SELFSTEAL_PORT}${NC}  (не чужой сайт:443)"
+        echo -e "       serverNames  = ${GREEN}[\"${DOMAIN}\"]${NC}  (только свой домен)"
+        echo -e "     Inbound'ы с чужим target/serverNames удалите или пересоздайте: «Новый конфиг для Hosts»."
+        echo -e "  2) ${BOLD}Nodes${NC}: ноде назначен только профиль SelfSteal, лишние inbound'ы не отмечены."
+        echo -e "  3) ${BOLD}Hosts${NC}: у всех хостов этой ноды SNI = ${GREEN}${DOMAIN}${NC}."
+        echo -e "  Затем: пункт 7 → «Перезапустить» и снова эта проверка."
+        return 1
+    fi
+    ok "Все TLS-порты отдают только сертификат ${DOMAIN} — схема SelfSteal соблюдена."
+    echo -e "  ${DIM}Проверьте ещё в панели: у всех Hosts этой ноды SNI = ${DOMAIN} — его клиенты шлют в каждом подключении.${NC}"
+}
+
 selfsteal_menu() {
     load_state
     local c def="1"
@@ -2435,12 +2501,14 @@ selfsteal_menu() {
         "2|Новый конфиг для Hosts|Новый случайный порт, ключи x25519 и shortId" \
         "3|Показать сохранённые конфиги|Все выданные порты и настройки хостов" \
         "4|Проверить сайт|DNS, nginx, сертификат, порты Reality — почему сайт не открывается" \
+        "5|Проверка на соответствие SelfSteal|Какой сертификат отдаёт каждый порт на чужие SNI — как проверяет хостер" \
         "0|Назад|"
     case "$c" in
         1) flow_selfsteal ;;
         2) generate_selfsteal_config ;;
         3) show_selfsteal_configs ;;
         4) check_selfsteal_site ;;
+        5) selfsteal_audit ;;
         *) return 2 ;;
     esac
 }
