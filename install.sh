@@ -101,6 +101,9 @@ if [[ ! -r /dev/tty ]]; then
 fi
 
 ORIG_STTY="$(stty -g </dev/tty 2>/dev/null)"
+# Backspace стирает букву целиком, а не половину UTF-8 символа
+# (иначе в ответах остаются «обрывки» кириллицы, и certbot падает)
+stty iutf8 </dev/tty 2>/dev/null
 restore_tty() {
     printf '\e[?25h' >/dev/tty 2>/dev/null   # вернуть курсор
     [[ -n "$ORIG_STTY" ]] && stty "$ORIG_STTY" </dev/tty 2>/dev/null
@@ -429,6 +432,28 @@ REALITY_PORTS="${REALITY_PORTS}"
 SITE_PUBLIC443="${SITE_PUBLIC443}"
 EOF
     chmod 600 "$STATE_FILE"
+}
+
+# Email для Let's Encrypt: только латиница, иначе ACME отказывает в регистрации.
+# Пустой ответ — регистрация без email.
+ask_email() {
+    local e
+    while true; do
+        ask e "Email для Let's Encrypt (Enter — без email)" ""
+        e="${e//[[:space:]]/}"
+        if [[ -z "$e" ]]; then
+            EMAIL=""; return 0
+        fi
+        if LC_ALL=C grep -q '[^ -~]' <<<"$e"; then
+            warn "В email есть русские или непечатаемые символы — переключите раскладку на EN и введите заново."
+            continue
+        fi
+        if [[ ! "$e" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+            warn "Похоже, это не email: '${e}'. Пример: admin@example.com"
+            continue
+        fi
+        EMAIL="$e"; return 0
+    done
 }
 
 normalize_domain() {
@@ -931,7 +956,7 @@ obtain_node_certificate() {
     local d="$1" owner email_args=(--register-unsafely-without-email)
     apt_install certbot || { err "Не удалось установить certbot"; return 1; }
 
-    [[ -z "$EMAIL" ]] && ask EMAIL "Email для Let's Encrypt (Enter — без email)" ""
+    [[ -z "$EMAIL" ]] && ask_email
     [[ -n "$EMAIL" ]] && email_args=(-m "$EMAIL")
 
     owner="$(port_owner 80)"
@@ -1175,7 +1200,7 @@ ask_site_params() {
         err "Некорректный домен: '$DOMAIN'"
         return 1
     fi
-    ask EMAIL "Email для Let's Encrypt (Enter — без email)" ""
+    ask_email
 
     choose_site_template || return 1
 
@@ -1428,17 +1453,62 @@ EOF
     systemctl reload nginx
 }
 
+# Доступен ли сервер Let's Encrypt с этой машины
+acme_reachable() {
+    curl -fsS --max-time 10 -o /dev/null https://acme-v02.api.letsencrypt.org/directory 2>/dev/null
+}
+
+# Проверка, что ACME-запрос дойдёт до nginx через 80 порт (с самого сервера)
+acme_selfcheck() {
+    local token="selfcheck-$RANDOM$RANDOM" got
+    mkdir -p "${ACME_ROOT}/.well-known/acme-challenge"
+    echo "$token" >"${ACME_ROOT}/.well-known/acme-challenge/${token}"
+    got="$(curl -s --noproxy '*' --max-time 5 --resolve "${DOMAIN}:80:127.0.0.1" \
+            "http://${DOMAIN}/.well-known/acme-challenge/${token}" 2>/dev/null)"
+    rm -f "${ACME_ROOT}/.well-known/acme-challenge/${token}"
+    [[ "$got" == "$token" ]]
+}
+
 obtain_certificate() {
-    local email_args=(--register-unsafely-without-email)
-    [[ -n "$EMAIL" ]] && email_args=(-m "$EMAIL")
-    info "Получаю сертификат Let's Encrypt для $DOMAIN..."
-    if ! certbot certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" \
-            --agree-tos --non-interactive --keep-until-expiring \
-            "${email_args[@]}" \
-            --deploy-hook "systemctl reload nginx"; then
-        err "Не удалось получить сертификат. Проверьте DNS и доступность порта 80 извне."
+    local email_args log
+    if ! acme_reachable; then
+        err "Сервер Let's Encrypt (acme-v02.api.letsencrypt.org) недоступен с этого сервера."
+        err "Проверьте исходящий интернет / DNS сервера (cat /etc/resolv.conf) и повторите."
         return 1
     fi
+    if ! acme_selfcheck; then
+        warn "nginx не отдаёт файлы проверки по http://${DOMAIN}/.well-known/acme-challenge/ — certbot может не пройти проверку."
+    fi
+
+    log="$(mktemp)"
+    while true; do
+        email_args=(--register-unsafely-without-email)
+        [[ -n "$EMAIL" ]] && email_args=(-m "$EMAIL")
+        info "Получаю сертификат Let's Encrypt для $DOMAIN${EMAIL:+ (email: $EMAIL)}..."
+        # Подробный трейсбек certbot прячем в лог, на экран — только суть
+        if PYTHONIOENCODING=utf-8 certbot certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" \
+                --agree-tos --non-interactive --keep-until-expiring \
+                "${email_args[@]}" \
+                --deploy-hook "systemctl reload nginx" >"$log" 2>&1; then
+            break
+        fi
+        grep -vE '^\s|^Traceback|^--- Logging|^Call stack|^Message:|^Arguments:|UnicodeEncodeError' "$log" \
+            | grep -v '^$' | tail -n 8 | sed 's/^/     /'
+
+        if grep -q 'register an account' "$log" && [[ -n "$EMAIL" ]]; then
+            warn "Let's Encrypt не принял email '${EMAIL}'."
+            if confirm "Повторить без email?" y; then EMAIL=""; continue; fi
+        elif grep -qi 'too many\|rateLimited' "$log"; then
+            err "Превышен лимит Let's Encrypt для этого домена — подождите и повторите позже."
+        else
+            err "Не удалось получить сертификат. Проверьте DNS (A-запись на этот сервер) и доступность порта 80 извне."
+            if confirm "Попробовать ещё раз?" n; then continue; fi
+        fi
+        warn "Полный лог: /var/log/letsencrypt/letsencrypt.log"
+        rm -f "$log"
+        return 1
+    done
+    rm -f "$log"
     systemctl enable --now certbot.timer >/dev/null 2>&1
     ok "Сертификат получен, автопродление включено"
 }
