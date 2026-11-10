@@ -636,6 +636,77 @@ show_logs() {
     trap - INT
 }
 
+# ===================== ЗАПУСК / ОСТАНОВКА НОДЫ ========================
+node_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx remnanode; }
+
+node_start() {
+    cd "$NODE_DIR" || return 1
+    info "Запускаю ноду..."
+    docker compose up -d || { err "Не удалось запустить ноду"; return 1; }
+    sleep 4
+    if node_running; then
+        ok "Нода запущена"
+        docker compose logs --tail 10 -t
+    else
+        err "Контейнер не поднялся. Последние логи:"
+        docker compose logs --tail 30 -t
+        return 1
+    fi
+}
+
+node_stop() {
+    warn "Пользователи этой ноды потеряют подключение, пока она остановлена."
+    confirm "Остановить ноду?" y || return 0
+    cd "$NODE_DIR" || return 1
+    info "Останавливаю ноду..."
+    docker compose stop || { err "Не удалось остановить ноду"; return 1; }
+    if node_running; then
+        err "Контейнер всё ещё работает — проверьте: docker ps"
+        return 1
+    fi
+    ok "Нода остановлена"
+    echo -e "  ${DIM}Настройки и конфиг сохранены — запустить снова можно этим же пунктом.${NC}"
+    echo -e "  ${DIM}После перезагрузки сервера нода запустится сама (restart: always).${NC}"
+}
+
+node_restart() {
+    cd "$NODE_DIR" || return 1
+    info "Перезапускаю ноду..."
+    docker compose restart || { err "Не удалось перезапустить ноду"; return 1; }
+    sleep 4
+    if node_running; then
+        ok "Нода перезапущена"
+        docker compose logs --tail 10 -t
+    else
+        err "После перезапуска контейнер не работает. Последние логи:"
+        docker compose logs --tail 30 -t
+        return 1
+    fi
+}
+
+node_power_menu() {
+    if [[ ! -f "$COMPOSE_FILE" ]]; then err "Нода не установлена"; return 1; fi
+    local c def st
+    if node_running; then
+        st="${GREEN}работает${NC}"; def="2"
+    else
+        st="${YELLOW}остановлена${NC}"; def="1"
+    fi
+    echo -e "  Сейчас нода: ${st}"
+    echo
+    MENU_DEFAULT="$def" menu_select c inline "Нода" \
+        "1|▶ Запустить|docker compose up -d" \
+        "2|⏹ Остановить|Контейнер останавливается, настройки сохраняются" \
+        "3|🔄 Перезапустить|Например, если Happ не пингует сервер после смены профиля" \
+        "0|Назад|"
+    case "$c" in
+        1) if node_running; then info "Нода уже работает"; else node_start; fi ;;
+        2) if node_running; then node_stop; else info "Нода уже остановлена"; fi ;;
+        3) node_restart ;;
+        *) return 2 ;;
+    esac
+}
+
 # ===================== docker-compose.override.yml ====================
 # Один override-файл управляет и своим ядром Xray, и сертификатами.
 # Основной docker-compose.yml (из панели) скрипт не трогает.
@@ -1938,7 +2009,7 @@ check_and_fix_profile() {
                 BLOCK_RU="0"; save_state
                 if validate_profile "${base}-profile.json"; then
                     ok "Исправленный профиль проверен — ошибок нет"
-                    info "Чтобы вернуть блокировку RU: пункт 8 → обновить ядро и заменить geoip/geosite, затем новый конфиг."
+                    info "Чтобы вернуть блокировку RU: пункт 9 → обновить ядро и заменить geoip/geosite, затем новый конфиг."
                     echo; cat "${base}-profile.json"
                 else
                     err "Xray всё ещё не принимает профиль:"; tail -n 5 <<<"$VALIDATE_OUT" | sed 's/^/     /'
@@ -2351,7 +2422,7 @@ flow_node() {
     start_node           || return 1
     auto_protect_node_port
     node_finish_hint
-    echo -e "  ${DIM}Сертификаты для gRPC — пункт 9, сайт-заглушка — пункты 3/4.${NC}"
+    echo -e "  ${DIM}Сертификаты для gRPC — пункт 10, сайт-заглушка — пункты 3/4.${NC}"
 }
 
 flow_node_and_site() {
@@ -2531,7 +2602,7 @@ status_block() {
         if guard_active; then
             dot "$GREEN"  "Порт ноды " "${GREEN}только для панели${NC}"
         else
-            dot "$YELLOW" "Порт ноды " "${YELLOW}открыт для всех${NC} ${DIM}→ пункт 10${NC}"
+            dot "$YELLOW" "Порт ноды " "${YELLOW}открыт для всех${NC} ${DIM}→ пункт 11${NC}"
         fi
         if certs_mounted; then
             dot "$GREEN" "gRPC/TLS  " "${GRPC_DOMAIN:-сертификаты проброшены}"
@@ -2638,13 +2709,14 @@ main() {
             "5|🎨 Обновить / сменить сайт|Скачать свежую версию или поставить другой шаблон" \
             "---|Обслуживание" \
             "6|📜 Логи ноды|Живой вывод docker compose logs, выход — Ctrl+C" \
-            "7|🔄 Обновить ноду|Скачать свежий образ remnawave/node и перезапустить" \
-            "8|🧬 Ядро Xray|Поставить нужную версию Xray-core или вернуть встроенную" \
-            "9|🔐 Сертификаты gRPC|Пробросить сертификаты Let's Encrypt в контейнер ноды" \
-            "10|🔒 Закрыть порт ноды|API ноды доступен только IP панели — сканеры не увидят Remnawave" \
-            "11|🚧 rkn-guard|Запустить сторонний установщик Flecksis/rkn-guard" \
+            "7|⏯ Запуск / остановка ноды|Запустить, остановить или перезапустить контейнер ноды" \
+            "8|🔄 Обновить ноду|Скачать свежий образ remnawave/node и перезапустить" \
+            "9|🧬 Ядро Xray|Поставить нужную версию Xray-core или вернуть встроенную" \
+            "10|🔐 Сертификаты gRPC|Пробросить сертификаты Let's Encrypt в контейнер ноды" \
+            "11|🔒 Закрыть порт ноды|API ноды доступен только IP панели — сканеры не увидят Remnawave" \
+            "12|🚧 rkn-guard|Запустить сторонний установщик Flecksis/rkn-guard" \
             "---" \
-            "12|❌ Удаление|Удалить ноду или сайт-заглушку" \
+            "13|❌ Удаление|Удалить ноду или сайт-заглушку" \
             "0|🚪 Выход|"
         [[ "$choice" == "0" ]] && { printf '\e[H\e[2J'; echo -e "  ${CYAN}Пока!${NC}"; exit 0; }
         last="$choice"
@@ -2657,12 +2729,13 @@ main() {
             4)  flow_site_only ;;
             5)  update_site_files ;;
             6)  show_logs ;;
-            7)  update_node ;;
-            8)  core_menu ;;
-            9)  certs_menu ;;
-            10) guard_menu ;;
-            11) run_rkn_guard ;;
-            12) uninstall_menu ;;
+            7)  node_power_menu ;;
+            8)  update_node ;;
+            9)  core_menu ;;
+            10) certs_menu ;;
+            11) guard_menu ;;
+            12) run_rkn_guard ;;
+            13) uninstall_menu ;;
         esac
         rc=$?
         (( rc == 2 )) || pause      # 2 = «Назад» из подменю — сразу в главное меню
