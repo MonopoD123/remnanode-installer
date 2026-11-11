@@ -1906,6 +1906,84 @@ make_grpc_inbound_json() {
 EOF
 }
 
+# make_xhttp_inbound_json TAG PORT PRIVKEY SHORTID SNI TARGET PATH PADDING
+# XHTTP разбивает трафик на отдельные HTTP/2-запросы — нет одного длинного
+# TCP-потока, который ТСПУ «замораживает» после ~16 КБ. flow явно пустой:
+# панель не должна подставлять Vision. xPaddingBytes — случайный padding
+# в каждом запросе (диапазон свой для каждой генерации).
+make_xhttp_inbound_json() {
+    cat <<EOF
+{
+  "tag": "$1",
+  "port": $2,
+  "listen": "0.0.0.0",
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none",
+    "flow": ""
+  },
+  "sniffing": {
+    "enabled": true,
+    "routeOnly": true,
+    "destOverride": ["http", "tls", "quic"]
+  },
+  "streamSettings": {
+    "network": "xhttp",
+    "xhttpSettings": {
+      "path": "$7",
+      "mode": "auto",
+      "xPaddingBytes": "$8"
+    },
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "xver": 0,
+      "target": "$6",
+      "spiderX": "",
+      "shortIds": ["$4"],
+      "privateKey": "$3",
+      "serverNames": ["$5"]
+    }
+  }
+}
+EOF
+}
+
+# rand_range LO_MIN LO_MAX HI_MIN HI_MAX — строка "a-b" со случайными границами
+rand_range() {
+    printf '%d-%d' "$(shuf -i "$1-$2" -n 1)" "$(shuf -i "$3-$4" -n 1)"
+}
+
+# Путь XHTTP в стиле обычного сайта, а не «/xhttp»
+gen_xhttp_path() {
+    local -a pre=(assets static media cdn api content files img)
+    local -a mid=(v1 v2 v3 build dist pub res)
+    printf '/%s/%s/%s' "${pre[$((RANDOM % ${#pre[@]}))]}" "${mid[$((RANDOM % ${#mid[@]}))]}" \
+        "$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+# Клиентские настройки XHTTP для поля «extra» хоста в панели:
+#   xPaddingBytes — тот же диапазон, что на сервере;
+#   xmux — переиспользование соединений: меньше параллельных TLS-рукопожатий
+#          к одному SNI (по наблюдениям, их всплеск — триггер заморозки).
+#   Все значения — случайные диапазоны, свои для каждой генерации.
+#   maxConnections не задаём: Xray не разрешает его вместе с maxConcurrency.
+make_xhttp_extra_json() {
+    cat <<EOF
+{
+  "xPaddingBytes": "$1",
+  "xmux": {
+    "maxConcurrency": "$(rand_range 12 18 24 32)",
+    "cMaxReuseTimes": "$(rand_range 48 80 96 160)",
+    "hMaxRequestTimes": "$(rand_range 500 700 800 1000)",
+    "hMaxReusableSecs": "$(rand_range 1500 2100 2400 3300)",
+    "hKeepAlivePeriod": 0
+  }
+}
+EOF
+}
+
 # serviceName для gRPC: не «grpc» по умолчанию, а случайное имя в стиле API
 gen_service_name() {
     local -a pre=(api app sync data media feed core user stream event)
@@ -1917,7 +1995,7 @@ gen_service_name() {
 # profile_inbounds BASE — все inbound'ы конфига через запятую (для make_profile_json)
 profile_inbounds() {
     local f out=""
-    for f in "$1-inbound.json" "$1-grpc-inbound.json"; do
+    for f in "$1-inbound.json" "$1-grpc-inbound.json" "$1-xhttp-inbound.json"; do
         [[ -f "$f" ]] || continue
         [[ -n "$out" ]] && out+=$',\n'
         out+="$(cat "$f")"
@@ -2108,42 +2186,70 @@ generate_selfsteal_config() {
         "0|Пропускать|Всё идёт через ноду, но IP сервера могут занести в списки"
     [[ "$ru" == "1" ]] && BLOCK_RU="1" || BLOCK_RU="0"
 
-    # Протоколы: TCP+Vision — основной; gRPC — запасной (другой вид трафика,
-    # помогает, если TCP-вариант режут). Оба — Reality на тот же сайт-заглушку.
+    # Протоколы — любой набор из TCP Vision, gRPC и XHTTP. Все — Reality SelfSteal
+    # на один и тот же сайт-заглушку. Первый в наборе занимает выбранный порт,
+    # остальные получают свои случайные порты.
     local proto
     echo
     MENU_DEFAULT="${SELFSTEAL_PROTO:-both}" menu_select proto inline "Протоколы в профиле" \
-        "both|TCP Vision + gRPC (рекомендуется)|Два inbound'а на разных портах: основной и запасной" \
+        "both|TCP Vision + gRPC|Основной и запасной inbound на разных портах" \
+        "txh|TCP Vision + XHTTP|XHTTP — запасной, если TCP «замерзает» после ~16 КБ" \
+        "all|TCP Vision + gRPC + XHTTP|Три inbound'а: максимум запасных вариантов" \
+        "xhttp|Только XHTTP (при заморозке TCP)|Рекомендуется, если ТСПУ режет raw TCP; лучше ставить на 443" \
         "tcp|Только TCP Vision|Один inbound — самый быстрый вариант" \
         "grpc|Только gRPC|Без Vision; трафик похож на обычный HTTP/2 API"
     [[ "$proto" == "0" ]] && { info "Отменено"; return 1; }
     SELFSTEAL_PROTO="$proto"
 
-    local sid tag inbound base gsid gtag ginbound gport="" gservice inbounds=""
-    sid="$(gen_short_id)"
-    tag="VLESS_REALITY_SELFSTEAL_${REALITY_PORT}"
-    inbound="$(make_inbound_json "$tag" "$REALITY_PORT" "$REALITY_PRIV" "$sid" "$DOMAIN" "127.0.0.1:${SELFSTEAL_PORT}")"
+    local -a kinds=()
+    case "$proto" in
+        both)  kinds=(tcp grpc) ;;
+        txh)   kinds=(tcp xhttp) ;;
+        all)   kinds=(tcp grpc xhttp) ;;
+        *)     kinds=("$proto") ;;
+    esac
+    has_kind() { [[ " ${kinds[*]} " == *" $1 "* ]]; }
 
-    if [[ "$proto" != "tcp" ]]; then
-        if [[ "$proto" == "grpc" ]]; then
-            gport="$REALITY_PORT"         # только gRPC — он и занимает выбранный порт
+    # Порты: первый протокол — выбранный порт, остальные — случайные, без повторов
+    local -A kport=() ktag=() ksid=()
+    local k taken="${REALITY_PORTS} ${REALITY_PORT}" first=1
+    for k in "${kinds[@]}"; do
+        if (( first )); then
+            kport[$k]="$REALITY_PORT"; first=0
         else
-            # Отдельный случайный порт: выбранный TCP-порт считаем уже занятым
-            gport="$(REALITY_PORTS="${REALITY_PORTS} ${REALITY_PORT}" random_free_port "$REALITY_PORT_MIN" "$REALITY_PORT_MAX")" \
-                || { err "Не удалось подобрать порт для gRPC"; return 1; }
+            kport[$k]="$(REALITY_PORTS="$taken" random_free_port "$REALITY_PORT_MIN" "$REALITY_PORT_MAX")" \
+                || { err "Не удалось подобрать порт для ${k}"; return 1; }
         fi
-        gsid="$(gen_short_id)"
-        gservice="$(gen_service_name)"
-        gtag="VLESS_GRPC_REALITY_${gport}"
-        ginbound="$(make_grpc_inbound_json "$gtag" "$gport" "$REALITY_PRIV" "$gsid" "$DOMAIN" "127.0.0.1:${SELFSTEAL_PORT}" "$gservice")"
-    fi
+        taken+=" ${kport[$k]}"
+        ksid[$k]="$(gen_short_id)"
+    done
+    ktag[tcp]="VLESS_REALITY_SELFSTEAL_${kport[tcp]:-}"
+    ktag[grpc]="VLESS_GRPC_REALITY_${kport[grpc]:-}"
+    ktag[xhttp]="VLESS_XHTTP_REALITY_${kport[xhttp]:-}"
 
+    local target="127.0.0.1:${SELFSTEAL_PORT}" gservice="" xpath="" xpad="" xextra="" base inbounds
     mkdir -p "$SELFSTEAL_CFG_DIR"
     chmod 700 "$SELFSTEAL_CFG_DIR"
     base="${SELFSTEAL_CFG_DIR}/${REALITY_PORT}"
-    rm -f "${base}-inbound.json" "${base}-grpc-inbound.json"
-    [[ "$proto" != "grpc" ]] && printf '%s\n' "$inbound" >"${base}-inbound.json"
-    [[ -n "$gport" ]] && printf '%s\n' "$ginbound" >"${base}-grpc-inbound.json"
+    rm -f "${base}-inbound.json" "${base}-grpc-inbound.json" "${base}-xhttp-inbound.json" "${base}-xhttp-extra.json"
+
+    if has_kind tcp; then
+        make_inbound_json "${ktag[tcp]}" "${kport[tcp]}" "$REALITY_PRIV" "${ksid[tcp]}" "$DOMAIN" "$target" >"${base}-inbound.json"
+    fi
+    if has_kind grpc; then
+        gservice="$(gen_service_name)"
+        make_grpc_inbound_json "${ktag[grpc]}" "${kport[grpc]}" "$REALITY_PRIV" "${ksid[grpc]}" "$DOMAIN" "$target" "$gservice" \
+            >"${base}-grpc-inbound.json"
+    fi
+    if has_kind xhttp; then
+        xpath="$(gen_xhttp_path)"
+        xpad="$(rand_range 100 300 900 1400)"
+        make_xhttp_inbound_json "${ktag[xhttp]}" "${kport[xhttp]}" "$REALITY_PRIV" "${ksid[xhttp]}" "$DOMAIN" "$target" "$xpath" "$xpad" \
+            >"${base}-xhttp-inbound.json"
+        xextra="$(make_xhttp_extra_json "$xpad")"
+        printf '%s\n' "$xextra" >"${base}-xhttp-extra.json"
+    fi
+
     inbounds="$(profile_inbounds "$base")"
     make_profile_json "$inbounds" "$BLOCK_RU" >"${base}-profile.json"
     if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${base}-profile.json" 2>/dev/null; then
@@ -2154,40 +2260,50 @@ generate_selfsteal_config() {
     {
         echo "Создан:         $(date '+%Y-%m-%d %H:%M')"
         echo "Public key:     ${REALITY_PUB}"
-        echo "Reality target: 127.0.0.1:${SELFSTEAL_PORT}"
-        if [[ "$proto" != "grpc" ]]; then
-            echo
-            echo "[TCP + Vision]"
-            echo "Inbound tag:    ${tag}"
+        echo "Reality target: ${target}"
+        if has_kind tcp; then
+            echo; echo "[TCP + Vision]"
+            echo "Inbound tag:    ${ktag[tcp]}"
             echo "Address:        ${DOMAIN}"
-            echo "Port:           ${REALITY_PORT}"
+            echo "Port:           ${kport[tcp]}"
             echo "SNI:            ${DOMAIN}"
             echo "Fingerprint:    chrome"
-            echo "Short ID:       ${sid}"
+            echo "Short ID:       ${ksid[tcp]}"
         fi
-        if [[ -n "$gport" ]]; then
-            echo
-            echo "[gRPC]"
-            echo "Inbound tag:    ${gtag}"
+        if has_kind grpc; then
+            echo; echo "[gRPC]"
+            echo "Inbound tag:    ${ktag[grpc]}"
             echo "Address:        ${DOMAIN}"
-            echo "Port:           ${gport}"
+            echo "Port:           ${kport[grpc]}"
             echo "SNI:            ${DOMAIN}"
             echo "Fingerprint:    chrome"
             echo "serviceName:    ${gservice}"
-            echo "Short ID:       ${gsid}"
+            echo "Short ID:       ${ksid[grpc]}"
+        fi
+        if has_kind xhttp; then
+            echo; echo "[XHTTP]"
+            echo "Inbound tag:    ${ktag[xhttp]}"
+            echo "Address:        ${DOMAIN}"
+            echo "Port:           ${kport[xhttp]}"
+            echo "SNI:            ${DOMAIN}"
+            echo "Fingerprint:    chrome"
+            echo "Path:           ${xpath}"
+            echo "Mode:           auto"
+            echo "Short ID:       ${ksid[xhttp]}"
+            echo "XHTTP extra (xmux, padding) — вставить в настройки хоста:"
+            echo "$xextra"
         fi
     } >"${base}-host.txt"
     chmod 600 "${base}"-*
 
-    local p
-    for p in $([[ "$proto" != "grpc" ]] && echo "$REALITY_PORT") $gport; do
-        [[ " ${REALITY_PORTS} " != *" ${p} "* ]] && REALITY_PORTS="${REALITY_PORTS:+$REALITY_PORTS }${p}"
+    for k in "${kinds[@]}"; do
+        [[ " ${REALITY_PORTS} " != *" ${kport[$k]} "* ]] && REALITY_PORTS="${REALITY_PORTS:+$REALITY_PORTS }${kport[$k]}"
     done
     save_state
 
     if ufw_active; then
-        for p in $([[ "$proto" != "grpc" ]] && echo "$REALITY_PORT") $gport; do
-            ufw allow "${p}/tcp" >/dev/null && ok "UFW: открыт порт ${p}/tcp"
+        for k in "${kinds[@]}"; do
+            ufw allow "${kport[$k]}/tcp" >/dev/null && ok "UFW: открыт порт ${kport[$k]}/tcp"
         done
         ufw allow 80/tcp >/dev/null
         [[ "$SITE_PUBLIC443" == "1" ]] && ufw allow 443/tcp >/dev/null
@@ -2198,21 +2314,33 @@ generate_selfsteal_config() {
     line
     cat "${base}-profile.json"
     line
-    echo -e "${DIM}Только inbound'ы (чтобы добавить в существующий профиль): ${base}-inbound.json${gport:+, ${base}-grpc-inbound.json}${NC}"
+    echo -e "${DIM}Отдельные inbound'ы (чтобы добавить в существующий профиль): ${base}-*inbound.json${NC}"
     echo
-    local tags=""
-    [[ "$proto" != "grpc" ]] && tags="${CYAN}${tag}${NC}"
-    [[ -n "$gport" ]] && tags+="${tags:+ и }${CYAN}${gtag}${NC}"
+    local tags="" n=${#kinds[@]}
+    for k in "${kinds[@]}"; do tags+="${tags:+, }${CYAN}${ktag[$k]}${NC}"; done
     echo -e "${BOLD}2. Nodes${NC} → нода → выбрать профиль и отметить ${tags}"
-    echo -e "${BOLD}3. Hosts${NC} → создать хост${gport:+ для каждого inbound}:"
-    if [[ "$proto" != "grpc" ]]; then
-        echo -e "     ${BOLD}TCP Vision${NC}  Inbound: ${tag}"
-        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${REALITY_PORT}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+    if (( n > 1 )); then
+        echo -e "${BOLD}3. Hosts${NC} → создать хост для каждого inbound:"
+    else
+        echo -e "${BOLD}3. Hosts${NC} → создать хост:"
     fi
-    if [[ -n "$gport" ]]; then
-        echo -e "     ${BOLD}gRPC${NC}        Inbound: ${gtag}"
-        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${gport}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+    if has_kind tcp; then
+        echo -e "     ${BOLD}TCP Vision${NC}  Inbound: ${ktag[tcp]}"
+        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${kport[tcp]}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+    fi
+    if has_kind grpc; then
+        echo -e "     ${BOLD}gRPC${NC}        Inbound: ${ktag[grpc]}"
+        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${kport[grpc]}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
         echo -e "                 ${DIM}serviceName (${gservice}) панель берёт из inbound сама${NC}"
+    fi
+    if has_kind xhttp; then
+        echo -e "     ${BOLD}XHTTP${NC}       Inbound: ${ktag[xhttp]}"
+        echo -e "                 Address: ${DOMAIN}   Port: ${GREEN}${kport[xhttp]}${NC}   SNI: ${DOMAIN}   Fingerprint: chrome"
+        echo -e "                 ${DIM}path (${xpath}) и mode панель берёт из inbound сама${NC}"
+        echo -e "                 ${BOLD}XHTTP extra${NC} (в настройках хоста) — вставьте:"
+        sed 's/^/                   /' <<<"$xextra"
+        echo -e "                 ${DIM}Это xmux и padding для клиентов: меньше параллельных TLS-рукопожатий${NC}"
+        echo -e "                 ${DIM}к одному SNI. Если такого поля в панели нет — хост работает и без него.${NC}"
     fi
     echo -e "${BOLD}4. Internal Squads${NC} → добавить inbound'ы в сквад пользователей"
     line
@@ -2242,12 +2370,18 @@ security_notes() {
         echo -e "  ${YELLOW}!${NC} Порт ${REALITY_PORT}: долгий TLS на высокий порт заметнее для DPI."
         echo -e "    ${DIM}Для основного хоста лучше 443, случайные порты — для запасных.${NC}"
     fi
-    if [[ "${SELFSTEAL_PROTO:-both}" != "grpc" ]]; then
+    local pr="${SELFSTEAL_PROTO:-both}"
+    if [[ "$pr" =~ ^(both|txh|all|tcp)$ ]]; then
         echo -e "  ${GREEN}✓${NC} TCP: flow=xtls-rprx-vision прописан в inbound — проверьте, что он есть в ссылке подписки"
+        [[ "$pr" == "tcp" ]] && echo -e "    ${DIM}Если TCP «замерзает» после ~16 КБ — сгенерируйте конфиг с XHTTP${NC}"
     fi
-    if [[ "${SELFSTEAL_PROTO:-both}" != "tcp" ]]; then
+    if [[ "$pr" =~ ^(both|all|grpc)$ ]]; then
         echo -e "  ${GREEN}✓${NC} gRPC: flow пустой (Vision с gRPC не работает), serviceName случайный, не «grpc»"
-        echo -e "    ${DIM}gRPC — запасной вариант: чуть медленнее TCP Vision, но выглядит как обычный HTTP/2 API${NC}"
+    fi
+    if [[ "$pr" =~ ^(txh|all|xhttp)$ ]]; then
+        echo -e "  ${GREEN}✓${NC} XHTTP: трафик разбит на HTTP/2-запросы — нет длинного TCP-потока, который «замерзает»"
+        echo -e "    ${DIM}Случайные path и padding; вставьте XHTTP extra в хост — xmux снизит число рукопожатий${NC}"
+        echo -e "    ${DIM}Во время заморозки не меняйте fingerprint и не переподключайтесь — это продлевает бан${NC}"
     fi
     if guard_active; then
         echo -e "  ${GREEN}✓${NC} Порт ноды ${np} открыт только для панели"
